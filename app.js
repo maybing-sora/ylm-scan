@@ -320,14 +320,16 @@ function scanHTML(s) {
       <label>操作人<input id="who2" value="${esc(person)}"></label>
     </div>
     <div id="reader" hidden></div>
+    <div class="row" id="zoomRow" hidden><span class="small muted">放大</span><div class="filters" id="zoomBtns"></div></div>
     <div class="row">
       <button class="primary big grow" id="camBtn" style="flex:2">開啟鏡頭掃描</button>
       <button class="big grow" id="shoot" style="flex:1">拍照</button>
     </div>
     <form id="manual" class="row" autocomplete="off">
-      <input id="code" class="mono grow" inputmode="numeric" placeholder="輸入或用掃描槍刷條碼" style="flex:1;min-width:0">
+      <input id="code" class="mono grow" inputmode="numeric" placeholder="輸入條碼前幾碼或後幾碼" style="flex:1;min-width:0">
       <button type="submit">加入</button>
     </form>
+    <div id="sugg" class="list"></div>
     <div id="hit"></div>
     <details><summary class="small muted" style="cursor:pointer">掃不到？用品名搜尋</summary>
       <input id="q" placeholder="例：抱枕套 鐵線蕨" style="margin-top:8px"><div id="qres" class="list"></div></details>
@@ -339,7 +341,7 @@ function scanHTML(s) {
   ${s.type === "receive" ? `<section class="panel"><div class="row"><h3 class="grow">應收清單（${esc(s.vendor)}）</h3><span class="small muted mono" id="recvSum"></span></div><div id="expect" class="list"></div></section>` : ""}`;
 }
 function hitHTML() {
-  if (!lastHit) return `<p class="small muted" style="margin:0">鏡頭對準條碼就會自動加 1。同一件商品要移開再對準，才會再加一次。</p>`;
+  if (!lastHit) return `<p class="small muted" style="margin:0">鏡頭對準條碼就會自動加 1，同一件要移開再對準才會再加。小條碼請離 15–20 公分，用「放大」對準，不要貼太近。</p>`;
   if (lastHit.miss) return `<div class="card miss"><div class="nm">找不到這個條碼</div><div class="mono">${esc(lastHit.raw)}</div>
     <div class="small">商品主檔沒有這個號碼。請用品名搜尋，或先記下來之後再補資料。</div>
     <div class="row"><button class="sm" id="unk">記為未知條碼 +1</button></div></div>`;
@@ -432,11 +434,32 @@ function bindExpect() {
   });
 }
 
+/* ---- 輸入比對：前幾碼、後幾碼都可以 ---- */
+function suggest(raw) {
+  const v = String(raw || "").trim().replace(/\s+/g, "");
+  if (v.length < 3) return [];
+  const out = [];
+  for (const p of P) {
+    const keys = [p.c, String(p.bc || "")].filter(Boolean);
+    let rank = 9, how = "";
+    for (const k of keys) {
+      if (k === v) { rank = 0; how = "完全相符"; }
+      else if (k.startsWith(v) && rank > 1) { rank = 1; how = "前幾碼相符"; }
+      else if (k.endsWith(v) && rank > 2) { rank = 2; how = "後幾碼相符"; }
+      else if (v.length >= 4 && k.includes(v) && rank > 3) { rank = 3; how = "中間相符"; }
+    }
+    if (rank < 9) out.push({ p, rank, how });
+  }
+  return out.sort((a, b) => a.rank - b.rank).slice(0, 8);
+}
+const hl = (k, v) => { v = String(v || "").trim(); const i = v ? String(k).indexOf(v) : -1; return i < 0 ? esc(k) : esc(k.slice(0, i)) + "<b>" + esc(k.slice(i, i + v.length)) + "</b>" + esc(k.slice(i + v.length)); };
+
 /* ---- 掃描 ---- */
 let scanner = null, camOn = false, actx = null;
 const seen = new Map(); // code -> 最後一次在畫面上看到的時間
 function handleCode(raw, src) {
   const s = String(raw || "").trim(); if (!s) return;
+  if (/^https?:|^www\./i.test(s)) { if (src !== "cam") toast("讀到的是 QR Code 網址，請對準一維條碼"); return; }
   if (!person) { toast("請先輸入操作人"); return; }
   const p = lookup(s);
   const key = p ? p.c : s;
@@ -461,44 +484,89 @@ function beep(ok) {
 }
 function formats() {
   const F = window.Html5QrcodeSupportedFormats;
-  return F ? [F.CODE_128, F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_39, F.ITF, F.QR_CODE] : undefined;
+  return F ? [F.CODE_128, F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_39, F.ITF] : undefined;
 }
 async function startCamera() {
   if (!window.Html5Qrcode) { toast("掃描元件沒有載入，請確認網路後重新整理"); return; }
   const box = document.getElementById("reader"); box.hidden = false;
   try {
     scanner = new window.Html5Qrcode("reader", { verbose: false, formatsToSupport: formats(), experimentalFeatures: { useBarCodeDetectorIfSupported: true } });
-    await scanner.start({ facingMode: "environment" },
-      { fps: 12, qrbox: (w, h) => ({ width: Math.floor(Math.min(w * 0.9, 420)), height: Math.floor(Math.min(h * 0.5, 160)) }), disableFlip: true },
-      text => handleCode(text, "cam"), () => {});
+    const cfg = { fps: 15, disableFlip: true,
+      qrbox: (w, h) => ({ width: Math.floor(w * 0.92), height: Math.floor(Math.min(h * 0.45, w * 0.45)) }),
+      videoConstraints: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } } };
+    try { await scanner.start({ facingMode: "environment" }, cfg, text => handleCode(text, "cam"), () => {}); }
+    catch (e1) { delete cfg.videoConstraints; await scanner.start({ facingMode: "environment" }, cfg, text => handleCode(text, "cam"), () => {}); }
     camOn = true;
+    setupZoom();
   } catch (e) {
     box.hidden = true; scanner = null; camOn = false;
     toast("無法開啟鏡頭。請在瀏覽器允許使用相機，或改用「拍照」。");
   }
   const b = document.getElementById("camBtn"); if (b) b.textContent = camOn ? "關閉鏡頭" : "開啟鏡頭掃描";
 }
+function setupZoom() {
+  const row = document.getElementById("zoomRow"), box = document.getElementById("zoomBtns");
+  if (!row || !scanner) return;
+  try {
+    const z = scanner.getRunningTrackCameraCapabilities().zoomFeature();
+    if (!z.isSupported()) { row.hidden = true; return; }
+    const min = z.min(), max = z.max();
+    const levels = [1, 1.5, 2, 3].filter(v => v >= min && v <= max);
+    if (levels.length < 2) { row.hidden = true; return; }
+    box.innerHTML = levels.map(v => `<button aria-pressed="${v === 1}" data-z="${v}">${v}×</button>`).join("");
+    box.querySelectorAll("[data-z]").forEach(b => b.onclick = async () => {
+      try { await z.apply(+b.dataset.z); box.querySelectorAll("[data-z]").forEach(x => x.setAttribute("aria-pressed", x === b)); } catch (e) {}
+    });
+    row.hidden = false;
+  } catch (e) { row.hidden = true; }
+}
 function stopCamera() {
+  const zr = document.getElementById("zoomRow"); if (zr) zr.hidden = true;
   if (scanner && camOn) { try { scanner.stop().then(() => scanner.clear()).catch(() => {}); } catch (e) {} }
   camOn = false; scanner = null;
 }
+// 拍照辨識：整張圖讀不到時，切成多塊、縮放後逐塊再試（小條碼、反光時比較讀得到）
 async function decodeImage(file) {
+  let bmp = null;
+  try { bmp = await createImageBitmap(file, { imageOrientation: "from-image" }); } catch (e) { try { bmp = await createImageBitmap(file); } catch (e2) { return null; } }
   if ("BarcodeDetector" in window) {
     try {
-      const det = new window.BarcodeDetector({ formats: ["code_128", "ean_13", "ean_8", "upc_a", "upc_e", "code_39", "itf", "qr_code"] });
-      const r = await det.detect(await createImageBitmap(file));
-      if (r && r.length) return r[0].rawValue;
+      const det = new window.BarcodeDetector({ formats: ["code_128", "ean_13", "ean_8", "upc_a", "upc_e", "code_39", "itf"] });
+      const r = await det.detect(bmp);
+      const hit = (r || []).map(x => x.rawValue).find(v => lookup(v)) || (r && r[0] && r[0].rawValue);
+      if (hit) return hit;
     } catch (e) {}
   }
-  if (window.Html5Qrcode) {
-    try {
-      let tmp = document.getElementById("fileReader");
-      if (!tmp) { tmp = document.createElement("div"); tmp.id = "fileReader"; tmp.hidden = true; document.body.appendChild(tmp); }
-      const q = new window.Html5Qrcode("fileReader", { verbose: false, formatsToSupport: formats() });
-      return await q.scanFile(file, false);
-    } catch (e) {}
+  const Z = window.ZXing;
+  if (!Z) return null;
+  const F = Z.BarcodeFormat, hints = new Map();
+  hints.set(Z.DecodeHintType.POSSIBLE_FORMATS, [F.CODE_128, F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_39, F.ITF]);
+  hints.set(Z.DecodeHintType.TRY_HARDER, true);
+  const reader = new Z.MultiFormatReader(); reader.setHints(hints);
+  const W = bmp.width, H = bmp.height, cv = document.createElement("canvas"), cx = cv.getContext("2d", { willReadFrequently: true });
+  const tryRegion = (sx, sy, sw, sh, tw) => {
+    tw = Math.min(tw, sw); const th = Math.round(sh * tw / sw);
+    cv.width = tw; cv.height = th; cx.drawImage(bmp, sx, sy, sw, sh, 0, 0, tw, th);
+    const d = cx.getImageData(0, 0, tw, th).data, g = new Uint8ClampedArray(tw * th);
+    for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = (d[j] * 299 + d[j + 1] * 587 + d[j + 2] * 114) / 1000;
+    for (const B of [Z.HybridBinarizer, Z.GlobalHistogramBinarizer]) {
+      try { return reader.decode(new Z.BinaryBitmap(new B(new Z.RGBLuminanceSource(g, tw, th)))).getText(); } catch (e) {}
+    }
+    return null;
+  };
+  const regions = [[0, 0, W, H, 1400]];
+  for (const [fw, fh, nx, ny] of [[0.6, 0.3, 3, 5], [0.45, 0.2, 3, 7]]) {
+    const cw = W * fw, ch = H * fh;
+    for (let gy = 0; gy < ny; gy++) for (let gx = 0; gx < nx; gx++)
+      regions.push([(W - cw) * gx / (nx - 1), (H - ch) * gy / (ny - 1), cw, ch, 900]);
   }
-  return null;
+  let first = null;
+  for (let i = 0; i < regions.length; i++) {
+    const t = tryRegion(...regions[i]);
+    if (t && !/^https?:|^www\./i.test(t)) { if (lookup(t)) return t; first = first || t; }
+    if (i % 4 === 3) await new Promise(r => setTimeout(r, 0)); // 讓畫面有機會更新
+  }
+  return first;
 }
 function bindSession(s) {
   document.getElementById("home").onclick = () => go({ name: "home" });
@@ -520,7 +588,23 @@ function bindSession(s) {
     if (code) handleCode(code, "photo"); else { beep(false); toast("沒有辨識到條碼，請靠近一點、讓條碼橫向填滿畫面"); }
   };
   const form = document.getElementById("manual"), ci = document.getElementById("code");
-  form.onsubmit = e => { e.preventDefault(); handleCode(ci.value, "manual"); ci.value = ""; ci.focus(); };
+  const sugg = document.getElementById("sugg");
+  const clearSugg = () => { sugg.innerHTML = ""; };
+  ci.oninput = () => {
+    const m = suggest(ci.value);
+    if (!m.length) { sugg.innerHTML = ci.value.trim().length >= 3 ? `<p class="small muted" style="margin:0">沒有符合的條碼。</p>` : ""; return; }
+    sugg.innerHTML = m.map(({ p, how }) => `<div class="item"><span class="grow"><span class="name">${esc(p.n)}</span><br><span class="small mono muted">${hl(p.c, ci.value)}${p.bc ? " · " + hl(p.bc, ci.value) : ""} · ${how}</span></span><button class="sm" data-pick="${p.c}">＋1</button></div>`).join("");
+    sugg.querySelectorAll("[data-pick]").forEach(b => b.onclick = () => { handleCode(b.dataset.pick, "manual"); ci.value = ""; clearSugg(); ci.focus(); });
+  };
+  form.onsubmit = e => {
+    e.preventDefault();
+    const v = ci.value.trim(); if (!v) return;
+    if (lookup(v)) { handleCode(v, "manual"); ci.value = ""; clearSugg(); ci.focus(); return; }
+    const m = suggest(v);
+    if (m.length === 1) { handleCode(m[0].p.c, "manual"); ci.value = ""; clearSugg(); ci.focus(); return; }
+    if (m.length > 1) { toast(`有 ${m.length} 個品項符合，請從下方選一個`); return; }
+    handleCode(v, "manual"); ci.value = ""; clearSugg();
+  };
   const q = document.getElementById("q"), qres = document.getElementById("qres");
   q.oninput = () => {
     const terms = q.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
