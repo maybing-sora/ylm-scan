@@ -22,6 +22,7 @@ const TYPES = {
 const TYPE_BY_LABEL = { "驗收": "receive", "調撥": "transfer", "退貨": "return", "盤點": "count" };
 const ZONES = ["整區", "A 牆", "B 牆", "中島", "櫃檯", "後場收納", "倉庫層架"];
 const ISSUE_KINDS = ["數量短少", "數量超收", "外箱或商品破損", "送錯款式或顏色", "缺條碼或吊牌（已補標）", "缺中文標示", "其他"];
+const OTHER_KINDS = ISSUE_KINDS.slice(2); // 數量以外的問題
 const ISSUE_STATUS = ["待處理", "已通知廠商", "已解決"];
 
 let device = LS.get("device", null);
@@ -391,6 +392,11 @@ function remainingFor(s, code, got) {
   return Math.max(0, p.q - before);
 }
 const editing = new Set(); // 應收清單裡正在填實收數的品項
+function issuesFor(code) {
+  const r = remote[view.id]; if (!r || !r.issues) return [];
+  return [...new Set(r.issues.filter(i => String(i["產品編號"]) === code).map(i => i["異常類型"]))];
+}
+const shortKind = k => ({ "外箱或商品破損": "破損", "送錯款式或顏色": "送錯款", "缺條碼或吊牌（已補標）": "已補標", "缺中文標示": "缺中文標示" }[k] || k);
 function expectHTML(s) {
   const t = totals(view.id);
   let gotSum = 0, needSum = 0;
@@ -400,22 +406,28 @@ function expectHTML(s) {
     if (!need && !g) return "";
     const st = g === need ? ["ok", "相符"] : g === 0 ? ["", "未點"] : g < need ? ["warn", `短 ${need - g}`] : ["bad", `多 ${g - need}`];
     const head = `<span class="grow"><span class="name">${esc(p.n)}</span><br><span class="small mono muted">${p.c}${p.bc ? "" : " · 需貼六福標"}${need !== p.q ? ` · 訂 ${p.q}，先前已收 ${p.q - need}` : ""}</span></span>`;
+    const kinds = issuesFor(p.c);
+    const tags = kinds.filter(k => !k.startsWith("數量")).map(k => `<span class="chip bad">${esc(shortKind(k))}</span>`).join("");
     if (editing.has(p.c)) {
-      const v = g && g !== need ? g : "";
+      const v = g || need;
       return `<div class="item" style="flex-direction:column;align-items:stretch">
         <div class="row">${head}<span class="mono small">應收 ${need}</span></div>
-        <div class="row">
-          <label style="min-width:110px;flex:0 0 120px">實收數量<input type="number" min="0" inputmode="numeric" id="ed-${p.c}" value="${v}" placeholder="${need}"></label>
-          <label style="min-width:160px">說明（選填）<input id="note-${p.c}" placeholder="例：外箱壓破 1 件"></label>
+        <label style="min-width:0">實收數量（實際收到的總數）<input type="number" min="0" inputmode="numeric" id="ed-${p.c}" value="${v}"></label>
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <span class="small muted">其他問題（可複選；數量不對會自動回報，不用勾）</span>
+          ${OTHER_KINDS.map((k, i) => `<label style="flex-direction:row;align-items:center;gap:8px;color:var(--fg);min-width:0"><input type="checkbox" id="k${i}-${p.c}" style="width:auto"> ${k}</label>`).join("")}
         </div>
-        <label style="flex-direction:row;align-items:center;gap:8px;color:var(--fg)"><input type="checkbox" id="rep-${p.c}" checked style="width:auto"> 同時回報異常給 Echo</label>
+        <div class="grid2">
+          <label style="min-width:0">有問題的件數<input type="number" min="1" inputmode="numeric" id="kq-${p.c}" value="1"></label>
+          <label style="min-width:0">說明（選填）<input id="note-${p.c}" placeholder="例：外箱壓破，玻璃杯裂 1 件"></label>
+        </div>
         <div class="row"><button class="sm" data-cancel="${p.c}">取消</button><button class="sm primary grow" data-save="${p.c}" data-need="${need}" data-got="${g}">儲存</button></div>
       </div>`;
     }
     const actions = g === need
-      ? `<button class="sm ghost" data-edit="${p.c}">修改</button>`
-      : `<button class="sm" data-match="${p.c}" data-need="${need - g}">相符 ✓</button><button class="sm" data-edit="${p.c}">不符</button>`;
-    return `<div class="item">${head}<span class="mono small">${g}/${need}</span><span class="chip ${st[0]}">${st[1]}</span>${actions}</div>`;
+      ? `<button class="sm ghost" data-edit="${p.c}">有問題</button>`
+      : `<button class="sm" data-match="${p.c}" data-need="${need - g}">相符 ✓</button><button class="sm" data-edit="${p.c}">有問題</button>`;
+    return `<div class="item">${head}<span class="mono small">${g}/${need}</span><span class="chip ${st[0]}">${st[1]}</span>${tags}${actions}</div>`;
   });
   const sum = document.getElementById("recvSum"); if (sum) sum.textContent = `${gotSum} / ${needSum}`;
   return rows.join("") || `<p class="small muted">料號表裡沒有這家廠商的品項。</p>`;
@@ -471,16 +483,20 @@ function bindExpect() {
     const others = got - myCount(code); // 其他人或其他區域已記的數量
     if (qty < others) { toast(`其他人已記 ${others} 件，實收不能小於這個數字`); return; }
     if (!bump(code, 0, qty - others)) return;
-    const p = byCode.get(code);
-    if (document.getElementById("rep-" + code).checked && qty !== need) {
-      const issue = { id: "I" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), sessionId: view.id, location: s.location, vendor: p ? p.v : s.vendor,
-        code, name: p ? p.n : code, kind: qty < need ? "數量短少" : "數量超收", qty: Math.abs(need - qty),
-        note: document.getElementById("note-" + code).value.trim(), person, reportedAt: nowIso(), status: "待處理" };
-      const r = remote[view.id] = remote[view.id] || { sheets: {}, issues: [] };
-      r.issues = [toIssueRow(issue)].concat(r.issues || []); LS.set("remote", remote);
+    const p = byCode.get(code), note = document.getElementById("note-" + code).value.trim();
+    const kq = Math.max(1, Math.round(+document.getElementById("kq-" + code).value || 1));
+    const list = [];
+    if (qty !== need) list.push({ kind: qty < need ? "數量短少" : "數量超收", qty: Math.abs(need - qty) });
+    OTHER_KINDS.forEach((k, i) => { if (document.getElementById(`k${i}-${code}`).checked) list.push({ kind: k, qty: kq }); });
+    const r = remote[view.id] = remote[view.id] || { sheets: {}, issues: [] };
+    list.forEach((x, n) => {
+      const issue = { id: "I" + Date.now().toString(36) + n + Math.random().toString(36).slice(2, 5), sessionId: view.id, location: s.location, vendor: p ? p.v : s.vendor,
+        code, name: p ? p.n : code, kind: x.kind, qty: x.qty, note, person, reportedAt: nowIso(), status: "待處理" };
+      r.issues = [toIssueRow(issue)].concat(r.issues || []);
       enqueue("saveIssue", issue.id, { issue });
-      toast(`已記錄實收 ${qty} 件，並回報${issue.kind} ${issue.qty} 件`);
-    } else toast(`已記錄實收 ${qty} 件`);
+    });
+    LS.set("remote", remote);
+    toast(list.length ? `已記錄實收 ${qty} 件，回報：${list.map(x => shortKind(x.kind) + " " + x.qty + " 件").join("、")}` : `已記錄實收 ${qty} 件`);
     editing.delete(code); lastHit = null; refreshScanParts();
   });
 }
