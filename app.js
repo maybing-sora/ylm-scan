@@ -85,6 +85,7 @@ async function flush() {
     while (queue.length) {
       const q = queue[0];
       await apiPost(Object.assign({ a: q.op }, q.body));
+      if (q.op === "saveSession" && sessions[q.key]) delete sessions[q.key]._local;
       queue.shift(); saveLocal();
     }
     lastError = ""; online = true;
@@ -119,6 +120,9 @@ async function boot() {
     const j = await apiGet({ a: "boot" });
     setMaster(j.products); LOCS = j.locations || []; RECEIVED = j.received || {};
     LS.set("master", { products: j.products, locations: LOCS, received: RECEIVED, at: nowIso() });
+    const onServer = new Set((j.sessions || []).map(s => s["單號"]));
+    const pendingIds = new Set(queue.map(q => q.body.sessionId || (q.body.session && q.body.session.id)));
+    for (const id of Object.keys(sessions)) if (!onServer.has(id) && !sessions[id]._local && !pendingIds.has(id)) dropLocal(id);
     (j.sessions || []).forEach(s => { const loc = sessions[s["單號"]]; if (!loc || !loc._local) sessions[s["單號"]] = fromRow(s); });
     saveLocal(); online = true;
   } catch (e) {
@@ -126,6 +130,12 @@ async function boot() {
     else online = false;
   }
   render(); flush();
+}
+function dropLocal(id) {
+  delete sessions[id]; delete remote[id];
+  for (const k of Object.keys(sheets)) if (sheets[k].sessionId === id) delete sheets[k];
+  queue = queue.filter(q => (q.body.sessionId || (q.body.session && q.body.session.id)) !== id);
+  LS.set("remote", remote); saveLocal();
 }
 function fromRow(s) {
   return { id: s["單號"], type: TYPE_BY_LABEL[s["類型"]] || "count", date: day(s["作業日期"]), poDate: day(s["進貨單日期"]), location: s["地點"], to: s["目的地"],
@@ -163,12 +173,12 @@ function totals(id) {
 
 /* ================= 畫面 ================= */
 let view = { name: "home" };
-let lastHit = null, issueOpen = false, resultFilter = "all", confirmAsk = false, issueFilter = "open";
+let lastHit = null, issueOpen = false, resultFilter = "all", confirmAsk = false, deleteAsk = false, issueFilter = "open";
 const app = document.getElementById("app");
 function toast(msg) { const t = document.getElementById("toast"); t.textContent = msg; t.hidden = false; clearTimeout(toast._t); toast._t = setTimeout(() => t.hidden = true, 2800); }
 function go(v) {
   stopCamera();
-  view = v; lastHit = null; issueOpen = false; confirmAsk = false; resultFilter = "all";
+  view = v; lastHit = null; issueOpen = false; confirmAsk = false; deleteAsk = false; resultFilter = "all";
   render(); window.scrollTo(0, 0);
   if (v.name === "session") loadRemote(v.id).then(() => { if (view.name === "session" && view.id === v.id) render(true); });
   if (v.name === "issues") loadIssues();
@@ -692,6 +702,10 @@ function resultInner(s) {
       ${pending ? `<div class="note warn">還有 ${pending} 筆掃描沒有上傳，連上網路後再確認入帳。</div>` : ""}
       ${confirmAsk ? `<div class="confirm"><b>確定要確認入帳？</b><span class="small">${fin}所有人的掃描會以試算表上的最新紀錄為準。</span><div class="row"><button id="no">取消</button><button class="primary grow" id="yes">確認入帳</button></div></div>`
         : `<button class="primary big" id="finalize" ${pending ? "disabled" : ""}>確認入帳</button><p class="small muted" style="margin:0">${fin}</p>`}
+    </section>
+    <section class="panel">
+      ${deleteAsk ? `<div class="confirm"><b>確定要刪除這張單？</b><span class="small">單號 ${esc(s.id)} 的所有掃描紀錄和異常回報都會一起刪除，無法復原。</span><div class="row"><button id="noDel">取消</button><button class="danger grow" id="yesDel">刪除</button></div></div>`
+        : `<button class="danger" id="del">刪除這張單</button><p class="small muted" style="margin:0">測試資料或建錯的單可以刪除。已確認入帳的單要先重新開啟。</p>`}
     </section>`}`;
 }
 function bindResult(s) {
@@ -717,6 +731,16 @@ function bindResult(s) {
       toast(j.already ? "這張單之前已經入帳" : `已入帳，寫入 ${j.written} 筆異動`);
       confirmAsk = false; await loadRemote(s.id); refreshReceived(); render();
     } catch (e) { toast("入帳失敗：" + (e instanceof TypeError ? "沒有網路" : e.message)); yes.disabled = false; yes.textContent = "確認入帳"; }
+  };
+  const dl = document.getElementById("del"); if (dl) dl.onclick = () => { deleteAsk = true; render(true); };
+  const nd = document.getElementById("noDel"); if (nd) nd.onclick = () => { deleteAsk = false; render(true); };
+  const yd = document.getElementById("yesDel"); if (yd) yd.onclick = async () => {
+    yd.disabled = true; yd.textContent = "刪除中…";
+    const wasLocalOnly = !!s._local && queue.some(q => q.op === "saveSession" && q.key === s.id);
+    try {
+      if (!wasLocalOnly) await apiPost({ a: "deleteSession", id: s.id });
+      dropLocal(s.id); toast("已刪除"); go({ name: "home" });
+    } catch (e) { toast("刪除失敗：" + (e instanceof TypeError ? "沒有網路" : e.message)); yd.disabled = false; yd.textContent = "刪除"; }
   };
   const yr = document.getElementById("yesReopen"); if (yr) yr.onclick = async () => {
     yr.disabled = true;

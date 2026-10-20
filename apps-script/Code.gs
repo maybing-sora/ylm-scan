@@ -98,6 +98,7 @@ function doPost(e) {
         case 'saveIssue': return saveIssue_(body.issue);
         case 'finalize': return finalize_(body.id, body.person);
         case 'reopen': return reopen_(body.id);
+        case 'deleteSession': return deleteSession_(body.id);
         default: throw new Error('未知的動作');
       }
     } finally { lock.releaseLock(); }
@@ -373,6 +374,16 @@ function reopen_(id) {
   replaceRows_('counts', function (r) { return String(r[0]) !== String(id); }, [], 4);
   sheet_('sessions').getRange(idx + 2, 11, 1, 4).setValues([['進行中', '', '', nowIso_()]]);
   return {};
+}
+
+// 刪除整張單（含掃描紀錄、異常回報）。已確認入帳的單要先重新開啟才能刪。
+function deleteSession_(id) {
+  var st = sessionStatus_(id);
+  if (st === '已確認') throw new Error('這張單已確認入帳，請先重新開啟再刪除');
+  replaceRows_('sessions', function (r) { return String(r[0]) !== String(id); }, [], 0);
+  replaceRows_('scans', function (r) { return String(r[1]) !== String(id); }, [], 6);
+  replaceRows_('issues', function (r) { return String(r[2]) !== String(id); }, [], 6);
+  return { deleted: id };
 }
 
 /* ============ 庫存 ============ */
