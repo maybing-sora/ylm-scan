@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<title>棲蘭明池點收盤點</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one-column field tool — sticky header, camera + big actions on top, running list below */
+:root{
+  --bg:#f3f4f1; --surface:#ffffff; --sunk:#e8ebe5; --line:#d3d8cf;
+  --fg:#1f2a24; --muted:#5f6b63;
+  --accent:#3f6b55; --accent-fg:#ffffff; --accent-soft:#dde8e0;
+  --ok:#2f7a4a; --ok-soft:#dcefe2; --warn:#a86a12; --warn-soft:#f6e8cf; --bad:#b03a2e; --bad-soft:#f6dcd8; --info:#3c6283; --info-soft:#dbe6f0;
+  --sans:"Noto Sans TC",system-ui,-apple-system,"PingFang TC","Microsoft JhengHei",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){:root{
+  --bg:#141a17; --surface:#1c2420; --sunk:#232d28; --line:#33403a;
+  --fg:#e5ebe6; --muted:#9aa89f;
+  --accent:#86b89c; --accent-fg:#10201a; --accent-soft:#25382e;
+  --ok:#7cc495; --ok-soft:#1f3527; --warn:#e2b061; --warn-soft:#3a2f1c; --bad:#ec8a7f; --bad-soft:#3d2321; --info:#93b7d8; --info-soft:#1f2c38; color-scheme:dark}}
+*{box-sizing:border-box}
+html{padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:15px;line-height:1.5}
+[hidden]{display:none!important}
+body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:10;background:var(--surface)}
+.wrap{max-width:760px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:12px 48px;display:flex;flex-direction:column;gap:16px}
+header.top{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;background:var(--surface);border-bottom:1px solid var(--line)}
+header.top .in{max-width:760px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+h1{font-size:17px;margin:0;font-weight:700;letter-spacing:.02em}
+h2{font-size:16px;margin:0;font-weight:700;text-wrap:balance}
+h3{font-size:13px;margin:0;font-weight:500;color:var(--muted);letter-spacing:.06em}
+.grow{flex:1;min-width:0}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:2px 10px;border-radius:999px;background:var(--sunk);color:var(--muted);white-space:nowrap}
+.chip.ok{background:var(--ok-soft);color:var(--ok)} .chip.warn{background:var(--warn-soft);color:var(--warn)} .chip.bad{background:var(--bad-soft);color:var(--bad)} .chip.info{background:var(--info-soft);color:var(--info)}
+.dot{width:7px;height:7px;border-radius:50%;background:currentColor}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:12px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+label{font-size:13px;color:var(--muted);display:flex;flex-direction:column;gap:4px;flex:1;min-width:140px}
+input,select,textarea{font:inherit;font-size:16px;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:9px 10px;width:100%}
+input:focus-visible,select:focus-visible,textarea:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button{font:inherit;cursor:pointer;border:1px solid var(--line);background:var(--surface);color:var(--fg);border-radius:8px;padding:9px 14px;font-weight:500}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-fg)}
+button.danger{border-color:var(--bad);color:var(--bad)}
+button.big{font-size:17px;padding:16px;width:100%;font-weight:700}
+button.ghost{background:transparent;border-color:transparent;color:var(--accent);padding:6px 8px}
+button.sm{padding:5px 10px;font-size:13px}
+button:disabled{opacity:.5;cursor:default}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.muted{color:var(--muted)} .small{font-size:12px}
+.list{display:flex;flex-direction:column}
+.item{display:flex;gap:10px;align-items:center;padding:10px 0;border-top:1px solid var(--line);flex-wrap:wrap}
+.item:first-child{border-top:0}
+.item .name{font-weight:500;overflow-wrap:anywhere}
+.qty{display:flex;align-items:center;gap:4px}
+.qty button{width:38px;height:38px;padding:0;font-size:18px}
+.qty input{width:64px;text-align:center;padding:6px;font-family:var(--mono)}
+.card{border:2px solid var(--accent);border-radius:10px;padding:14px;background:var(--accent-soft);display:flex;flex-direction:column;gap:8px}
+.card.miss{border-color:var(--bad);background:var(--bad-soft)}
+.card .nm{font-size:18px;font-weight:700;overflow-wrap:anywhere}
+.modes{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+.mode{display:flex;flex-direction:column;align-items:flex-start;gap:2px;text-align:left;padding:14px}
+.mode b{font-size:17px}
+.sess{display:flex;gap:10px;align-items:center;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--surface);cursor:pointer;text-align:left;width:100%}
+.sess:hover{border-color:var(--accent)}
+.tabs{display:flex;gap:4px;background:var(--sunk);border-radius:9px;padding:3px}
+.tabs button{flex:1;border:0;background:transparent;padding:8px}
+.tabs button[aria-selected="true"]{background:var(--surface);box-shadow:0 1px 2px rgba(0,0,0,.08)}
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{font-weight:500;color:var(--muted);background:var(--sunk);white-space:nowrap}
+td.num,th.num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+tr:last-child td{border-bottom:0}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px}
+.stat{background:var(--sunk);border-radius:8px;padding:10px}
+.stat b{display:block;font-family:var(--mono);font-size:22px;font-weight:500}
+.toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(16px + env(safe-area-inset-bottom,0px));background:var(--fg);color:var(--bg);padding:10px 16px;border-radius:8px;font-size:14px;z-index:20;max-width:calc(100% - 32px)}
+.note{font-size:13px;color:var(--muted);background:var(--sunk);border-radius:8px;padding:10px 12px}
+.note.warn{background:var(--warn-soft);color:var(--warn)}
+.filters{display:flex;gap:6px;flex-wrap:wrap}
+.filters button{border-radius:999px;padding:4px 12px;font-size:13px}
+.filters button[aria-pressed="true"]{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+#reader{width:100%;border-radius:10px;overflow:hidden;background:#000}
+#reader video{width:100%!important;display:block}
+.confirm{border:1px solid var(--warn);background:var(--warn-soft);color:var(--fg);border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:10px}
+@media (max-width:420px){.grid2{grid-template-columns:1fr}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<header class="top"><div class="in">
+  <h1 class="grow" id="hdr">棲蘭明池 點收盤點</h1>
+  <span class="chip" id="sync"><span class="dot"></span><span id="syncText">啟動中</span></span>
+</div></header>
+<main class="wrap" id="app"><p class="muted">載入中…</p></main>
+<div class="toast" id="toast" hidden></div>
+<input type="file" id="cam" accept="image/*" capture="environment" hidden>
+
+<script src="config.js"></script>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
