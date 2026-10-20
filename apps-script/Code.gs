@@ -177,13 +177,16 @@ function loadProducts_() {
   var out = [], seen = {};
   ss.getSheets().forEach(function (sh) {
     var vals = sh.getDataRange().getDisplayValues();
+    // 找標題列：同一列裡要有一格以「產品編號」開頭、一格以「產品條碼」開頭
+    // （不能用整列文字比對，料號表第一列的說明文字也提到這兩個詞）
+    var starts = function (row, name) { return row.some(function (x) { return String(x).trim().indexOf(name) === 0; }); };
     var hi = -1;
-    for (var i = 0; i < Math.min(vals.length, 10); i++) {
-      if (vals[i].join('|').indexOf('產品編號') >= 0 && vals[i].join('|').indexOf('產品條碼') >= 0) { hi = i; break; }
+    for (var i = 0; i < Math.min(vals.length, 15); i++) {
+      if (starts(vals[i], '產品編號') && starts(vals[i], '產品條碼')) { hi = i; break; }
     }
     if (hi < 0) return;
     var H = vals[hi];
-    var col = function (name) { for (var j = 0; j < H.length; j++) if (String(H[j]).indexOf(name) === 0) return j; return -1; };
+    var col = function (name) { for (var j = 0; j < H.length; j++) if (String(H[j]).trim().indexOf(name) === 0) return j; return -1; };
     var c = { code: col('產品編號'), brand: col('品牌名稱'), loc: col('商品銷售點'), type: col('產品別'), cat: col('產品類別'),
       name: col('規格說明'), unit: col('單位'), price: col('商品定價'), vendor: col('供應商'), bar: col('產品條碼'), qty: col('數量') };
     for (var r = 0; r < vals.length; r++) {
