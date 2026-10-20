@@ -390,16 +390,32 @@ function remainingFor(s, code, got) {
   const before = (RECEIVED[code] || 0) - (locked(s) ? got : 0);
   return Math.max(0, p.q - before);
 }
+const editing = new Set(); // 應收清單裡正在填實收數的品項
 function expectHTML(s) {
   const t = totals(view.id);
   let gotSum = 0, needSum = 0;
   const rows = P.filter(p => p.v === s.vendor).map(p => {
     const g = (t.get(p.c) || { qty: 0 }).qty, need = remainingFor(s, p.c, g);
     gotSum += g; needSum += need;
+    if (!need && !g) return "";
     const st = g === need ? ["ok", "相符"] : g === 0 ? ["", "未點"] : g < need ? ["warn", `短 ${need - g}`] : ["bad", `多 ${g - need}`];
-    return `<div class="item"><span class="grow"><span class="name">${esc(p.n)}</span><br><span class="small mono muted">${p.c}${p.bc ? "" : " · 需貼六福標"}${need !== p.q ? ` · 訂 ${p.q}，先前已收 ${p.q - need}` : ""}</span></span>
-      <span class="mono small">${g}/${need}</span><span class="chip ${st[0]}">${st[1]}</span>
-      ${g !== need && need > 0 ? `<button class="sm" data-match="${p.c}" data-need="${need - g}">相符 ✓</button>` : ""}</div>`;
+    const head = `<span class="grow"><span class="name">${esc(p.n)}</span><br><span class="small mono muted">${p.c}${p.bc ? "" : " · 需貼六福標"}${need !== p.q ? ` · 訂 ${p.q}，先前已收 ${p.q - need}` : ""}</span></span>`;
+    if (editing.has(p.c)) {
+      const v = g && g !== need ? g : "";
+      return `<div class="item" style="flex-direction:column;align-items:stretch">
+        <div class="row">${head}<span class="mono small">應收 ${need}</span></div>
+        <div class="row">
+          <label style="min-width:110px;flex:0 0 120px">實收數量<input type="number" min="0" inputmode="numeric" id="ed-${p.c}" value="${v}" placeholder="${need}"></label>
+          <label style="min-width:160px">說明（選填）<input id="note-${p.c}" placeholder="例：外箱壓破 1 件"></label>
+        </div>
+        <label style="flex-direction:row;align-items:center;gap:8px;color:var(--fg)"><input type="checkbox" id="rep-${p.c}" checked style="width:auto"> 同時回報異常給 Echo</label>
+        <div class="row"><button class="sm" data-cancel="${p.c}">取消</button><button class="sm primary grow" data-save="${p.c}" data-need="${need}" data-got="${g}">儲存</button></div>
+      </div>`;
+    }
+    const actions = g === need
+      ? `<button class="sm ghost" data-edit="${p.c}">修改</button>`
+      : `<button class="sm" data-match="${p.c}" data-need="${need - g}">相符 ✓</button><button class="sm" data-edit="${p.c}">不符</button>`;
+    return `<div class="item">${head}<span class="mono small">${g}/${need}</span><span class="chip ${st[0]}">${st[1]}</span>${actions}</div>`;
   });
   const sum = document.getElementById("recvSum"); if (sum) sum.textContent = `${gotSum} / ${needSum}`;
   return rows.join("") || `<p class="small muted">料號表裡沒有這家廠商的品項。</p>`;
@@ -438,11 +454,34 @@ function bindMine() {
   m.querySelectorAll("input[data-c]").forEach(i => i.onchange = () => { bump(i.dataset.c, 0, +i.value || 0); refreshScanParts(); });
 }
 function bindExpect() {
+  const s = sessions[view.id];
+  const myCount = code => { const sh = sheets[sheetKey(view.id, view.zone)]; return (sh && sh.counts[code]) || 0; };
   document.querySelectorAll("[data-match]").forEach(b => b.onclick = () => {
     const code = b.dataset.match, need = +b.dataset.need;
-    const sh = sheets[sheetKey(view.id, view.zone)], mine = (sh && sh.counts[code]) || 0;
-    if (bump(code, 0, mine + need)) { const p = byCode.get(code); lastHit = null; toast(`已標記相符：${p ? p.n : code}`); }
+    if (bump(code, 0, myCount(code) + need)) { const p = byCode.get(code); lastHit = null; toast(`已標記相符：${p ? p.n : code}`); }
     refreshScanParts();
+  });
+  document.querySelectorAll("[data-edit]").forEach(b => b.onclick = () => { editing.add(b.dataset.edit); refreshScanParts(); const i = document.getElementById("ed-" + b.dataset.edit); if (i) i.focus(); });
+  document.querySelectorAll("[data-cancel]").forEach(b => b.onclick = () => { editing.delete(b.dataset.cancel); refreshScanParts(); });
+  document.querySelectorAll("[data-save]").forEach(b => b.onclick = () => {
+    const code = b.dataset.save, need = +b.dataset.need, got = +b.dataset.got;
+    const raw = document.getElementById("ed-" + code).value.trim();
+    if (raw === "") { toast("請填實收數量"); return; }
+    const qty = Math.max(0, Math.round(+raw || 0));
+    const others = got - myCount(code); // 其他人或其他區域已記的數量
+    if (qty < others) { toast(`其他人已記 ${others} 件，實收不能小於這個數字`); return; }
+    if (!bump(code, 0, qty - others)) return;
+    const p = byCode.get(code);
+    if (document.getElementById("rep-" + code).checked && qty !== need) {
+      const issue = { id: "I" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), sessionId: view.id, location: s.location, vendor: p ? p.v : s.vendor,
+        code, name: p ? p.n : code, kind: qty < need ? "數量短少" : "數量超收", qty: Math.abs(need - qty),
+        note: document.getElementById("note-" + code).value.trim(), person, reportedAt: nowIso(), status: "待處理" };
+      const r = remote[view.id] = remote[view.id] || { sheets: {}, issues: [] };
+      r.issues = [toIssueRow(issue)].concat(r.issues || []); LS.set("remote", remote);
+      enqueue("saveIssue", issue.id, { issue });
+      toast(`已記錄實收 ${qty} 件，並回報${issue.kind} ${issue.qty} 件`);
+    } else toast(`已記錄實收 ${qty} 件`);
+    editing.delete(code); lastHit = null; refreshScanParts();
   });
 }
 
