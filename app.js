@@ -344,11 +344,12 @@ function scanHTML(s) {
     <details><summary class="small muted" style="cursor:pointer">掃不到？用品名搜尋</summary>
       <input id="q" placeholder="例：抱枕套 鐵線蕨" style="margin-top:8px"><div id="qres" class="list"></div></details>
   </section>
-  <section class="panel">
+  ${s.type === "receive" ? `<section class="panel"><div class="row"><h3 class="grow">應收清單（${esc(s.vendor)}）</h3><span class="small muted mono" id="recvSum"></span></div><div id="expect" class="list"></div></section>
+  <details class="panel"><summary style="cursor:pointer"><h3 id="mineTitle" style="display:inline"></h3></summary><div id="mine" class="list"></div></details>`
+  : `<section class="panel">
     <h3 id="mineTitle"></h3>
     <div id="mine" class="list"></div>
-  </section>
-  ${s.type === "receive" ? `<section class="panel"><div class="row"><h3 class="grow">應收清單（${esc(s.vendor)}）</h3><span class="small muted mono" id="recvSum"></span></div><div id="expect" class="list"></div></section>` : ""}`;
+  </section>`}`;
 }
 function hitHTML() {
   if (!lastHit) return `<p class="small muted" style="margin:0">鏡頭對準條碼就會自動加 1，同一件要移開再對準才會再加。小條碼請離 15–20 公分，用「放大」對準，不要貼太近。</p>`;
@@ -440,7 +441,8 @@ function bindExpect() {
   document.querySelectorAll("[data-match]").forEach(b => b.onclick = () => {
     const code = b.dataset.match, need = +b.dataset.need;
     const sh = sheets[sheetKey(view.id, view.zone)], mine = (sh && sh.counts[code]) || 0;
-    bump(code, 0, mine + need); refreshScanParts();
+    if (bump(code, 0, mine + need)) { const p = byCode.get(code); lastHit = null; toast(`已標記相符：${p ? p.n : code}`); }
+    refreshScanParts();
   });
 }
 
