@@ -387,7 +387,7 @@ function sessionHTML(s) {
       <span class="grow small muted">${s.vendor ? esc(s.vendor) + " · " : ""}作業日 ${esc(s.date)}${s.poDate ? " · 進貨單 " + esc(s.poDate) : ""}${s.memo ? " · " + esc(s.memo) : ""}<br>${esc(s.id)} · ${esc(s.createdBy || "")}</span>
       <button class="ghost sm" id="home">返回</button></div>
     <div class="tabs" role="tablist">
-      <button role="tab" id="tabScan" aria-selected="${view.tab === "scan"}">掃描</button>
+      <button role="tab" id="tabScan" aria-selected="${view.tab === "scan"}">${s.type === "receive" ? "點收" : "清點"}</button>
       <button role="tab" id="tabRes" aria-selected="${view.tab === "res"}">結果與入帳</button>
     </div>
   </section>
@@ -401,20 +401,13 @@ function scanHTML(s) {
       <label style="flex:2">區域<input id="zone" list="zonelist" value="${esc(view.zone)}"><datalist id="zonelist">${ZONES.map(z => `<option value="${z}">`).join("")}</datalist></label>
       <label>操作人（必填）<input id="who2" value="${esc(person)}" placeholder="你的名字"></label>
     </div>
-    <div id="reader" hidden></div>
-    <div class="row" id="zoomRow" hidden><span class="small muted">放大</span><div class="filters" id="zoomBtns"></div></div>
-    <div class="row">
-      <button class="primary big grow" id="camBtn" style="flex:2">開啟鏡頭掃描</button>
-      <button class="big grow" id="shoot" style="flex:1">拍照</button>
-    </div>
     <form id="manual" class="row" autocomplete="off">
-      <input id="code" class="mono grow" inputmode="numeric" placeholder="輸入條碼前幾碼或後幾碼" style="flex:1;min-width:0">
+      <input id="code" class="grow" placeholder="搜尋品名、產品編號或廠商條碼" style="flex:1;min-width:0">
       <button type="submit">加入</button>
     </form>
+    <span class="small muted">條碼打前幾碼或後幾碼都可以；品名可以打多個關鍵字，例如「抱枕套 鐵線蕨」。也可以用藍牙掃描槍刷條碼。</span>
     <div id="sugg" class="list"></div>
     <div id="hit"></div>
-    <details><summary class="small muted" style="cursor:pointer">掃不到？用品名搜尋</summary>
-      <input id="q" placeholder="例：抱枕套 鐵線蕨" style="margin-top:8px"><div id="qres" class="list"></div></details>
   </section>
   ${s.type === "receive" ? `<section class="panel"><div class="row"><h3 class="grow">應收清單（${esc(s.vendor)}）</h3><span class="small muted mono" id="recvSum"></span></div><div id="expect" class="list"></div></section>
   <details class="panel"><summary style="cursor:pointer"><h3 id="mineTitle" style="display:inline"></h3></summary><div id="mine" class="list"></div></details>`
@@ -424,7 +417,7 @@ function scanHTML(s) {
   </section>`}`;
 }
 function hitHTML() {
-  if (!lastHit) return `<p class="small muted" style="margin:0">鏡頭對準條碼就會自動加 1，同一件要移開再對準才會再加。小條碼請離 15–20 公分，用「放大」對準，不要貼太近。</p>`;
+  if (!lastHit) return "";
   if (lastHit.miss) return `<div class="card miss"><div class="nm">找不到這個條碼</div><div class="mono">${esc(lastHit.raw)}</div>
     <div class="small">商品主檔沒有這個號碼。請用品名搜尋，或先記下來之後再補資料。</div>
     <div class="row"><button class="sm" id="unk">記為未知條碼 +1</button></div></div>`;
@@ -663,9 +656,16 @@ function bindExpect() {
 /* ---- 輸入比對：前幾碼、後幾碼都可以 ---- */
 function suggest(raw) {
   const v = String(raw || "").trim().replace(/\s+/g, "");
-  if (v.length < 3) return [];
+  const terms = String(raw || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const isCode = /^\d+$/.test(v);
+  if (isCode ? v.length < 3 : !terms.length) return [];
   const out = [];
   for (const p of P) {
+    if (!isCode) {
+      const h = (p.n + " " + p.b + " " + p.c + " " + (p.bc || "")).toLowerCase();
+      if (terms.every(t => h.includes(t))) out.push({ p, rank: 4, how: "品名相符" });
+      continue;
+    }
     const keys = [p.c, String(p.bc || "")].filter(Boolean);
     let rank = 9, how = "";
     for (const k of keys) {
@@ -676,7 +676,7 @@ function suggest(raw) {
     }
     if (rank < 9) out.push({ p, rank, how });
   }
-  return out.sort((a, b) => a.rank - b.rank).slice(0, 8);
+  return out.sort((a, b) => a.rank - b.rank).slice(0, isCode ? 8 : 20);
 }
 const hl = (k, v) => { v = String(v || "").trim(); const i = v ? String(k).indexOf(v) : -1; return i < 0 ? esc(k) : esc(k.slice(0, i)) + "<b>" + esc(k.slice(i, i + v.length)) + "</b>" + esc(k.slice(i + v.length)); };
 
@@ -685,7 +685,7 @@ let scanner = null, camOn = false, actx = null;
 const seen = new Map(); // code -> 最後一次在畫面上看到的時間
 function handleCode(raw, src) {
   const s = String(raw || "").trim(); if (!s) return;
-  if (/^https?:|^www\./i.test(s)) { if (src !== "cam") toast("讀到的是 QR Code 網址，請對準一維條碼"); return; }
+  if (/^https?:|^www\./i.test(s)) { if (src !== "cam") toast("這不是商品條碼，請輸入品名、產品編號或廠商條碼"); return; }
   if (!person) { toast("請先輸入操作人"); return; }
   const p = lookup(s);
   const key = p ? p.c : s;
@@ -803,22 +803,12 @@ function bindSession(s) {
   const z = document.getElementById("zone");
   z.onchange = () => { view.zone = z.value.trim() || "整區"; LS.set("zone." + view.id, view.zone); lastHit = null; refreshScanParts(); };
   const w = document.getElementById("who2"); w.onchange = () => { person = w.value.trim(); LS.set("person", person); };
-  document.getElementById("camBtn").onclick = () => { if (camOn) { stopCamera(); document.getElementById("reader").hidden = true; document.getElementById("camBtn").textContent = "開啟鏡頭掃描"; } else startCamera(); };
-  const cam = document.getElementById("cam");
-  document.getElementById("shoot").onclick = () => { cam.value = ""; cam.click(); };
-  cam.onchange = async () => {
-    const f = cam.files && cam.files[0]; if (!f) return;
-    const btn = document.getElementById("shoot"); btn.disabled = true; btn.textContent = "辨識中…";
-    const code = await decodeImage(f);
-    btn.disabled = false; btn.textContent = "拍照";
-    if (code) handleCode(code, "photo"); else { beep(false); toast("沒有辨識到條碼，請靠近一點、讓條碼橫向填滿畫面"); }
-  };
   const form = document.getElementById("manual"), ci = document.getElementById("code");
   const sugg = document.getElementById("sugg");
   const clearSugg = () => { sugg.innerHTML = ""; };
   ci.oninput = () => {
     const m = suggest(ci.value);
-    if (!m.length) { sugg.innerHTML = ci.value.trim().length >= 3 ? `<p class="small muted" style="margin:0">沒有符合的條碼。</p>` : ""; return; }
+    if (!m.length) { sugg.innerHTML = ci.value.trim().length >= 2 ? `<p class="small muted" style="margin:0">沒有符合的品項。</p>` : ""; return; }
     sugg.innerHTML = m.map(({ p, how }) => `<div class="item"><span class="grow"><span class="name">${esc(p.n)}</span><br><span class="small mono muted">${hl(p.c, ci.value)}${p.bc ? " · " + hl(p.bc, ci.value) : ""} · ${how}</span></span><button class="sm" data-pick="${p.c}">＋1</button></div>`).join("");
     sugg.querySelectorAll("[data-pick]").forEach(b => b.onclick = () => { handleCode(b.dataset.pick, "manual"); ci.value = ""; clearSugg(); ci.focus(); });
   };
@@ -830,14 +820,6 @@ function bindSession(s) {
     if (m.length === 1) { handleCode(m[0].p.c, "manual"); ci.value = ""; clearSugg(); ci.focus(); return; }
     if (m.length > 1) { toast(`有 ${m.length} 個品項符合，請從下方選一個`); return; }
     handleCode(v, "manual"); ci.value = ""; clearSugg();
-  };
-  const q = document.getElementById("q"), qres = document.getElementById("qres");
-  q.oninput = () => {
-    const terms = q.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
-    if (!terms.length) { qres.innerHTML = ""; return; }
-    const hits = P.filter(p => { const h = (p.n + " " + p.b + " " + p.c + " " + (p.bc || "")).toLowerCase(); return terms.every(t => h.includes(t)); }).slice(0, 20);
-    qres.innerHTML = hits.map(p => `<div class="item"><span class="grow"><span class="name">${esc(p.n)}</span><br><span class="small mono muted">${p.c}</span></span><button class="sm" data-pick="${p.c}">＋1</button></div>`).join("") || `<p class="small muted">沒有符合的品項。</p>`;
-    qres.querySelectorAll("[data-pick]").forEach(b => b.onclick = () => handleCode(b.dataset.pick, "search"));
   };
   refreshScanParts();
 }
