@@ -874,6 +874,12 @@ function resultRows(s) {
   }
   return rows.map(r => Object.assign(r, { zones: r.g ? r.g.zones : {}, people: r.g ? [...r.g.people] : [] }));
 }
+function autoWarnHTML(s, rows) {
+  if (s.type !== "receive") return "";
+  const none = rows.filter(r => r.st === "none").length, diff = rows.filter(r => r.st === "short" || r.st === "over").length;
+  if (!none && !diff) return "";
+  return `<span class="small" style="color:var(--bad)">${none ? `${none} 個品項沒有掃到，會自動標為「未到貨」異常。` : ""}${diff ? `${diff} 個品項數量不符，沒回報的會自動標為短少或超收。` : ""}有掃漏的請先取消、補掃。</span>`;
+}
 const BD_COLS = [["open", "上次盤點"], ["recv", "＋進貨"], ["tin", "＋調入"], ["tout", "−調出"], ["ret", "−退貨"], ["sales", "−銷售"]];
 function resultInner(s) {
   const isCount = s.type === "count";
@@ -884,6 +890,7 @@ function resultInner(s) {
   const sh = Object.values(sheetsFor(view.id));
   const issues = (remote[view.id] && remote[view.id].issues) || [];
   const pending = queue.filter(q => (q.body.sessionId || (q.body.session && q.body.session.id)) === view.id).length;
+  const autoWarn = autoWarnHTML(s, rows);
   const fin = {
     receive: "確認後，實收數量會記入「" + s.location + "」的庫存。",
     transfer: `確認後，會從「${s.location}」扣除並加到「${s.to}」。`,
@@ -930,7 +937,7 @@ function resultInner(s) {
       ${confirmAsk ? `<div class="confirm"><b>確定要重新開啟？</b><span class="small">這張單寫入的庫存異動會被撤回，可以繼續修改後再確認一次。</span>${whoFieldHTML("whoAct")}<div class="row"><button id="no">取消</button><button class="danger grow" id="yesReopen">重新開啟</button></div></div>` : `<button class="danger" id="reopen">重新開啟</button>`}</section>`
     : `<section class="panel">
       ${pending ? `<div class="note warn">還有 ${pending} 筆掃描沒有上傳，連上網路後再確認入帳。</div>` : ""}
-      ${confirmAsk ? `<div class="confirm"><b>確定要確認入帳？</b><span class="small">${fin}所有人的掃描會以試算表上的最新紀錄為準。</span>${whoFieldHTML("whoAct")}<div class="row"><button id="no">取消</button><button class="primary grow" id="yes">確認入帳</button></div></div>`
+      ${confirmAsk ? `<div class="confirm"><b>確定要確認入帳？</b><span class="small">${fin}所有人的掃描會以試算表上的最新紀錄為準。</span>${autoWarn}${whoFieldHTML("whoAct")}<div class="row"><button id="no">取消</button><button class="primary grow" id="yes">確認入帳</button></div></div>`
         : `<button class="primary big" id="finalize" ${pending ? "disabled" : ""}>確認入帳</button><p class="small muted" style="margin:0">${fin}</p>`}
     </section>
     <section class="panel">
@@ -959,7 +966,7 @@ function bindResult(s) {
       if (queue.length) throw new Error("還有資料沒有上傳");
       const j = await apiPost({ a: "finalize", id: s.id, person });
       s.status = "已確認"; s.confirmedBy = person; s.confirmedAt = nowIso(); delete s._local; saveLocal();
-      toast(j.already ? "這張單之前已經入帳" : j.docError ? `已入帳，但${j.docError}` : `已入帳，寫入 ${j.written} 筆異動${j.doc ? "，驗收單 PDF 已產生" : ""}`);
+      toast(j.already ? "這張單之前已經入帳" : j.docError ? `已入帳，但${j.docError}` : `已入帳，寫入 ${j.written} 筆異動${j.autoIssues ? `，自動標示 ${j.autoIssues} 項數量異常` : ""}${j.doc ? "，驗收單 PDF 已產生" : ""}`);
       confirmAsk = false; await loadRemote(s.id); refreshReceived(); render();
     } catch (e) { toast("入帳失敗：" + (e instanceof TypeError ? "沒有網路" : e.message)); yes.disabled = false; yes.textContent = "確認入帳"; }
   };
@@ -1024,6 +1031,7 @@ const kindText = i => {
   const k = i["異常類型"], q = i["數量"];
   if (k === "數量短少") return `少 ${q} 件`;
   if (k === "數量超收") return `多 ${q} 件`;
+  if (k === "未到貨") return `未到貨 ${q} 件`;
   return `${shortKind(k)} ${q} 件`;
 };
 function productStatus(it) {

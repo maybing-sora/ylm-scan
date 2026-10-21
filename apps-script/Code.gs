@@ -482,8 +482,8 @@ function finalize_(id, person) {
       csh.getRange(cs, 1, cr.length, cr[0].length).setValues(cr);
     }
   }
-  var receipt = null;
-  if (type === '驗收') receipt = receiptRows_(id, s, totals, P, person, t);
+  var receipt = null, autoN = 0;
+  if (type === '驗收') { autoN = autoQtyIssues_(id, s, totals, P, person); receipt = receiptRows_(id, s, totals, P, person, t); }
   if (out.length) {
     var lsh = sheet_('ledger'), ls = lsh.getLastRow() + 1;
     lsh.getRange(ls, 5, out.length, 1).setNumberFormat('@');
@@ -491,7 +491,7 @@ function finalize_(id, person) {
   }
   var sh = sheet_('sessions');
   sh.getRange(idx + 2, 11, 1, 4).setValues([['已確認', person || '', t, t]]);
-  var res = { written: out.length };
+  var res = { written: out.length, autoIssues: autoN };
   log_('確認入帳', id, type + ' ' + s['地點'] + (s['目的地'] ? '→' + s['目的地'] : '') + (s['廠商'] ? ' ' + s['廠商'] : '') + '，寫入 ' + out.length + ' 筆異動');
   if (receipt) {
     var rsh = sheet_('receipts'), rs = rsh.getLastRow() + 1;
@@ -517,7 +517,8 @@ function reopen_(id) {
   });
   replaceRows_('docs', function (r) { return String(r[0]) !== String(id); }, [], 0);
   sheet_('sessions').getRange(idx + 2, 11, 1, 4).setValues([['進行中', '', '', nowIso_()]]);
-  log_('重新開啟', id, '撤回入帳與驗收單');
+  withdrawAutoIssues_(id);
+  log_('重新開啟', id, '撤回入帳、驗收單與自動標示的異常');
   return {};
 }
 
@@ -534,6 +535,37 @@ function deleteSession_(id) {
 }
 
 /* ============ 驗收對帳單 ============ */
+
+var AUTO_NOTE_ = '確認入帳時自動標示';
+
+// 確認入帳時：數量和進貨單不同、但沒人回報的品項，自動建立異常（沒掃到＝未到貨）
+function autoQtyIssues_(id, s, totals, P, person) {
+  var before = receivedTotals_(), have = {};
+  listIssues_().forEach(function (x) {
+    if (String(x['單號']) !== String(id) || x['處理狀態'] === '已撤回') return;
+    var k = x['異常類型'];
+    if (k === '數量短少' || k === '數量超收' || k === '未到貨') have[String(x['產品編號'])] = 1;
+  });
+  var n = 0, now = nowIso_();
+  Object.keys(P).forEach(function (c) {
+    var p = P[c];
+    if (p.v !== s['廠商'] || have[c]) return;
+    var ordered = Math.max(0, (p.q || 0) - (before[c] || 0)), got = totals[c] || 0;
+    if (got === ordered) return;
+    var kind = got === 0 ? '未到貨' : got < ordered ? '數量短少' : '數量超收';
+    saveIssue_({ id: 'A' + id + '-' + c, sessionId: id, location: s['地點'], vendor: p.v, code: c, name: p.n, kind: kind,
+      qty: Math.abs(ordered - got), note: AUTO_NOTE_, person: person || '', reportedAt: now, status: '待處理' });
+    n++;
+  });
+  return n;
+}
+
+function withdrawAutoIssues_(id) {
+  listIssues_().forEach(function (x) {
+    if (String(x['單號']) === String(id) && x['說明'] === AUTO_NOTE_ && x['處理狀態'] === '待處理')
+      saveIssue_({ id: x['編號'], status: '已撤回' });
+  });
+}
 
 function ensureHeader_(key) {
   var sh = sheet_(key), H = HEADERS[key];
@@ -554,7 +586,7 @@ function sessionIssues_(id) {
     var x = latest[k], c = String(x['產品編號']);
     by[c] = by[c] || { text: [], photos: [], notes: [] };
     var kind = x['異常類型'], q = x['數量'];
-    by[c].text.push(kind === '數量短少' ? '少 ' + q + ' 件' : kind === '數量超收' ? '多 ' + q + ' 件' : kind + ' ' + q + ' 件');
+    by[c].text.push(kind === '數量短少' ? '少 ' + q + ' 件' : kind === '數量超收' ? '多 ' + q + ' 件' : kind === '未到貨' ? '未到貨 ' + q + ' 件' : kind + ' ' + q + ' 件');
     if (x['說明'] && by[c].notes.indexOf(x['說明']) < 0) by[c].notes.push(x['說明']);
     String(x['照片'] || '').split(/\s+/).forEach(function (u) { if (u && by[c].photos.indexOf(u) < 0) by[c].photos.push(u); });
   });
