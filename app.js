@@ -69,12 +69,13 @@ async function apiGet(params) {
   return j;
 }
 async function apiPost(body) {
-  const r = await fetch(API, { method: "POST", redirect: "follow", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify(Object.assign({ pin }, body)) });
+  const r = await fetch(API, { method: "POST", redirect: "follow", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify(Object.assign({ pin, by: person, device }, body)) });
   const j = await r.json();
   if (!j.ok) { const e = new Error(j.error || "上傳失敗"); e.code = j.code; throw e; }
   return j;
 }
 function enqueue(op, key, body) {
+  if (!body.by) body.by = person; // 記下當時的操作人，晚點上傳也不會變
   queue = queue.filter(q => !(q.op === op && q.key === key)); // 同一筆只留最新
   queue.push({ op, key, body });
   saveLocal(); scheduleFlush();
@@ -354,7 +355,18 @@ function mySheet() {
   if (!sheets[k]) sheets[k] = { sessionId: view.id, zone: view.zone, person, device, counts: {}, updatedAt: nowIso() };
   return [k, sheets[k]];
 }
+// 操作人一定要填，否則不能修改、入帳或刪除
+function whoFieldHTML(id) {
+  return `<label style="min-width:0">操作人（必填）<input id="${id}" value="${esc(person)}" placeholder="輸入你的名字" autocomplete="name"></label>`;
+}
+function takeWho(id) {
+  const el = document.getElementById(id);
+  const v = el ? el.value.trim() : person;
+  if (!v) { toast("請先填寫操作人姓名"); if (el) el.focus(); return false; }
+  person = v; LS.set("person", person); return true;
+}
 function bump(code, delta, setTo) {
+  if (!person) { toast("請先在上方填寫操作人"); const w = document.getElementById("who2"); if (w) w.focus(); return false; }
   const s = sessions[view.id];
   if (locked(s)) { toast("這張單已確認入帳，不能再修改"); return false; }
   const [k, sh] = mySheet();
@@ -387,7 +399,7 @@ function scanHTML(s) {
   <section class="panel">
     <div class="row">
       <label style="flex:2">區域<input id="zone" list="zonelist" value="${esc(view.zone)}"><datalist id="zonelist">${ZONES.map(z => `<option value="${z}">`).join("")}</datalist></label>
-      <label>操作人<input id="who2" value="${esc(person)}"></label>
+      <label>操作人（必填）<input id="who2" value="${esc(person)}" placeholder="你的名字"></label>
     </div>
     <div id="reader" hidden></div>
     <div class="row" id="zoomRow" hidden><span class="small muted">放大</span><div class="filters" id="zoomBtns"></div></div>
@@ -575,6 +587,7 @@ function bindHit(s) {
   const oi = document.getElementById("openIssue"); if (oi) oi.onclick = () => { issueOpen = true; refreshScanParts(); };
   const ci = document.getElementById("cancelIssue"); if (ci) ci.onclick = () => { delete formPhotos["hit-" + lastHit.p.c]; issueOpen = false; refreshScanParts(); };
   const si = document.getElementById("sendIssue"); if (si) si.onclick = async () => {
+    if (!person) { toast("請先在上方填寫操作人"); return; }
     const p = lastHit.p, pkey = "hit-" + p.c, kind = document.getElementById("iKind").value;
     if (PHOTO_REQUIRED.includes(kind) && !(formPhotos[pkey] || []).length) { toast(`「${shortKind(kind)}」需要拍照`); return; }
     let photoIds = [];
@@ -914,14 +927,14 @@ function resultInner(s) {
   <section class="row"><button class="grow" id="copy">複製表格</button></section>
   ${locked(s) ? `<section class="panel"><p style="margin:0">已在 ${esc(fmt(s.confirmedAt))} 由 ${esc(s.confirmedBy || "")} 確認入帳。</p>
       ${remote[view.id] && remote[view.id].doc ? `<a class="primary" href="${esc(remote[view.id].doc.url)}" target="_blank" rel="noopener" style="display:block;text-align:center;padding:12px;border-radius:8px;background:var(--accent);color:var(--accent-fg);text-decoration:none;font-weight:700">開啟驗收單 PDF</a><p class="small muted" style="margin:0">PDF 存在 Drive「點收盤點_驗收單」資料夾，可以直接轉給財務。</p>` : ""}
-      ${confirmAsk ? `<div class="confirm"><b>確定要重新開啟？</b><span class="small">這張單寫入的庫存異動會被撤回，可以繼續修改後再確認一次。</span><div class="row"><button id="no">取消</button><button class="danger grow" id="yesReopen">重新開啟</button></div></div>` : `<button class="danger" id="reopen">重新開啟</button>`}</section>`
+      ${confirmAsk ? `<div class="confirm"><b>確定要重新開啟？</b><span class="small">這張單寫入的庫存異動會被撤回，可以繼續修改後再確認一次。</span>${whoFieldHTML("whoAct")}<div class="row"><button id="no">取消</button><button class="danger grow" id="yesReopen">重新開啟</button></div></div>` : `<button class="danger" id="reopen">重新開啟</button>`}</section>`
     : `<section class="panel">
       ${pending ? `<div class="note warn">還有 ${pending} 筆掃描沒有上傳，連上網路後再確認入帳。</div>` : ""}
-      ${confirmAsk ? `<div class="confirm"><b>確定要確認入帳？</b><span class="small">${fin}所有人的掃描會以試算表上的最新紀錄為準。</span><div class="row"><button id="no">取消</button><button class="primary grow" id="yes">確認入帳</button></div></div>`
+      ${confirmAsk ? `<div class="confirm"><b>確定要確認入帳？</b><span class="small">${fin}所有人的掃描會以試算表上的最新紀錄為準。</span>${whoFieldHTML("whoAct")}<div class="row"><button id="no">取消</button><button class="primary grow" id="yes">確認入帳</button></div></div>`
         : `<button class="primary big" id="finalize" ${pending ? "disabled" : ""}>確認入帳</button><p class="small muted" style="margin:0">${fin}</p>`}
     </section>
     <section class="panel">
-      ${deleteAsk ? `<div class="confirm"><b>確定要刪除這張單？</b><span class="small">單號 ${esc(s.id)} 的所有掃描紀錄和異常回報都會一起刪除，無法復原。</span><div class="row"><button id="noDel">取消</button><button class="danger grow" id="yesDel">刪除</button></div></div>`
+      ${deleteAsk ? `<div class="confirm"><b>確定要刪除這張單？</b><span class="small">單號 ${esc(s.id)} 的所有掃描紀錄和異常回報都會一起刪除，無法復原。</span>${whoFieldHTML("whoAct")}<div class="row"><button id="noDel">取消</button><button class="danger grow" id="yesDel">刪除</button></div></div>`
         : `<button class="danger" id="del">刪除這張單</button><p class="small muted" style="margin:0">測試資料或建錯的單可以刪除。已確認入帳的單要先重新開啟。</p>`}
     </section>`}`;
 }
@@ -939,6 +952,7 @@ function bindResult(s) {
   const ro = document.getElementById("reopen"); if (ro) ro.onclick = () => { confirmAsk = true; render(true); };
   const no = document.getElementById("no"); if (no) no.onclick = () => { confirmAsk = false; render(true); };
   const yes = document.getElementById("yes"); if (yes) yes.onclick = async () => {
+    if (!takeWho("whoAct")) return;
     yes.disabled = true; yes.textContent = "入帳中…";
     try {
       await flush();
@@ -952,6 +966,7 @@ function bindResult(s) {
   const dl = document.getElementById("del"); if (dl) dl.onclick = () => { deleteAsk = true; render(true); };
   const nd = document.getElementById("noDel"); if (nd) nd.onclick = () => { deleteAsk = false; render(true); };
   const yd = document.getElementById("yesDel"); if (yd) yd.onclick = async () => {
+    if (!takeWho("whoAct")) return;
     yd.disabled = true; yd.textContent = "刪除中…";
     const wasLocalOnly = !!s._local && queue.some(q => q.op === "saveSession" && q.key === s.id);
     try {
@@ -960,6 +975,7 @@ function bindResult(s) {
     } catch (e) { toast("刪除失敗：" + (e instanceof TypeError ? "沒有網路" : e.message)); yd.disabled = false; yd.textContent = "刪除"; }
   };
   const yr = document.getElementById("yesReopen"); if (yr) yr.onclick = async () => {
+    if (!takeWho("whoAct")) return;
     yr.disabled = true;
     try {
       await apiPost({ a: "reopen", id: s.id });
@@ -1018,6 +1034,7 @@ function issuesHTML() {
   const groups = issueGroups();
   return `
   <section class="row"><button class="ghost sm" id="home">返回</button><span class="grow"></span><button class="sm" id="reloadIssues">重新整理</button></section>
+  <section class="panel">${whoFieldHTML("whoIssue")}<span class="small muted">改處理狀態、標為已通知時，會記下操作人。</span></section>
   <div class="filters" role="group" aria-label="狀態">
     ${[["open", "未解決"], ["待處理", "待處理"], ["已通知廠商", "已通知廠商"], ["已解決", "已解決"], ["all", "全部"]].map(([k, l]) => `<button aria-pressed="${issueFilter === k}" data-if="${k}">${l}</button>`).join("")}
   </div>
@@ -1045,11 +1062,13 @@ function bindIssues() {
   document.getElementById("reloadIssues").onclick = loadIssues;
   document.querySelectorAll("[data-if]").forEach(b => b.onclick = () => { issueFilter = b.dataset.if; render(); });
   document.querySelectorAll("[data-pst]").forEach(sel => sel.onchange = () => {
+    if (!takeWho("whoIssue")) { render(); return; }
     const [sid, code] = sel.dataset.pst.split("|");
     setStatus(currentIssues().filter(i => i["單號"] === sid && String(i["產品編號"]) === code), sel.value);
     toast("已更新狀態"); render();
   });
   document.querySelectorAll("[data-notified]").forEach(b => b.onclick = () => {
+    if (!takeWho("whoIssue")) return;
     const v = b.dataset.notified;
     setStatus(currentIssues().filter(i => (i["廠商"] || "未指定廠商") === v && i["處理狀態"] === "待處理"), "已通知廠商");
     toast("已標為已通知廠商"); render();

@@ -20,7 +20,9 @@ var TABS = {
   sales: 'POS銷售',
   stock: '庫存彙總',
   receipts: '驗收對帳',
-  docs: '單據'
+  docs: '單據',
+  log: '操作紀錄',
+  issueSum: '異常彙總'
 };
 
 var HEADERS = {
@@ -30,6 +32,8 @@ var HEADERS = {
   counts: ['單號', '盤點日期', '地點', '產品編號', '品名', '帳面數', '實盤數', '差異', '確認人', '確認時間', '上次盤點', '進貨', '調入', '調出', '退貨', 'POS銷售'],
   receipts: ['單號', '驗收日期', '進貨單日期', '廠商', '產品編號', '品名', '產品別', '進貨單數量', '實收數量', '差異', '進貨單價', '應付金額', '異常', '照片', '驗收人', '確認入帳人', '確認時間'],
   docs: ['單號', '類型', '檔名', '網址', '檔案ID', '建立時間'],
+  log: ['時間', '操作人', '動作', '單號', '內容', '裝置'],
+  issueSum: ['單號', '廠商', '產品編號', '廠商條碼', '品名', '問題', '說明', '照片', '回報人', '最後回報時間', '處理狀態'],
   issues: ['編號', '回報時間', '單號', '地點', '廠商', '產品編號', '品名', '異常類型', '數量', '說明', '回報人', '處理狀態', '處理備註', '更新時間', '照片'],
   sales: ['銷售日期', '地點', '產品編號或條碼', '數量', '備註'],
   stock: ['地點', '產品編號', '品名', '廠商', '帳面數']
@@ -93,6 +97,10 @@ function doPost(e) {
   var body = {};
   try { body = JSON.parse(e.postData.contents); } catch (err) { return json_({ ok: false, error: '資料格式錯誤' }); }
   return run_(body.pin, function () {
+    // 每個會改資料的動作都要有操作人，並寫進「操作紀錄」
+    var who = String(body.by || body.person || '').trim();
+    if (body.a !== 'savePhoto' && !who) throw new Error('請先填寫操作人姓名');
+    CURRENT_ = { who: who, device: body.device || '' };
     var lock = LockService.getScriptLock();
     lock.waitLock(20000);
     try {
@@ -101,13 +109,20 @@ function doPost(e) {
         case 'saveSheet': return saveSheet_(body);
         case 'saveIssue': return saveIssue_(body.issue);
         case 'savePhoto': return savePhoto_(body);
-        case 'finalize': return finalize_(body.id, body.person);
+        case 'finalize': return finalize_(body.id, who);
         case 'reopen': return reopen_(body.id);
         case 'deleteSession': return deleteSession_(body.id);
         default: throw new Error('未知的動作');
       }
     } finally { lock.releaseLock(); }
   });
+}
+
+var CURRENT_ = { who: '', device: '' };
+function log_(action, id, detail) {
+  try {
+    sheet_('log').appendRow([nowIso_(), CURRENT_.who || '', action, id || '', detail || '', CURRENT_.device || '']);
+  } catch (e) {}
 }
 
 function run_(pin, fn) {
@@ -272,11 +287,13 @@ function saveSession_(s) {
     s.createdBy || '', s.createdAt || nowIso_(), idx >= 0 ? data[idx][10] : '進行中', idx >= 0 ? data[idx][11] : '', idx >= 0 ? data[idx][12] : '', nowIso_()];
   if (idx >= 0) sh.getRange(idx + 2, 1, 1, row.length).setValues([row]);
   else sh.appendRow(row);
+  log_(idx >= 0 ? '修改作業單' : '建立作業單', s.id, [row[1], row[4], row[5] ? '→' + row[5] : '', row[6], row[2]].filter(String).join(' '));
   return {};
 }
 
 function saveSheet_(b) {
   if (!b.sessionId || !b.key) throw new Error('缺少紀錄鍵');
+  if (!String(b.person || '').trim()) throw new Error('請先填寫操作人姓名');
   var st = sessionStatus_(b.sessionId);
   if (st === '已確認') throw new Error('這張單已確認入帳，掃描結果不會再變更');
   // 同一支手機、同一區域的紀錄整批覆蓋（只會覆蓋自己的紀錄）
@@ -320,7 +337,43 @@ function saveIssue_(x) {
     x.status || old['處理狀態'] || '待處理', x.resolution != null ? x.resolution : (old['處理備註'] || ''), nowIso_(), x.photos != null ? x.photos : (old['照片'] || '')];
   if (idx >= 0) sh.getRange(idx + 2, 1, 1, row.length).setValues([row]);
   else { sh.appendRow(row); sh.getRange(sh.getLastRow(), 6).setNumberFormat('@').setValue(row[5]); }
+  if (idx < 0) log_('回報異常', row[2], row[6] + '：' + row[7] + ' ' + row[8] + ' 件' + (row[9] ? '（' + row[9] + '）' : ''));
+  else if (x.status && x.status !== old['處理狀態']) log_('異常' + (x.status === '已撤回' ? '撤回' : '狀態改為「' + x.status + '」'), row[2], row[6] + '：' + row[7]);
+  refreshIssueSummary_();
   return {};
+}
+
+// 「異常彙總」：一個品項一列，只列目前有效的回報（同類型留最新、略過已撤回），和工具的異常清單一致
+function refreshIssueSummary_() {
+  var latest = {};
+  rows_('issues').forEach(function (r) {
+    var x = obj_('issues', r);
+    if (!x['編號'] || x['處理狀態'] === '已撤回') return;
+    var k = x['單號'] + '|' + x['產品編號'] + '|' + x['異常類型'];
+    if (!latest[k] || String(x['回報時間']) > String(latest[k]['回報時間'])) latest[k] = x;
+  });
+  var bar = {};
+  try { loadProducts_().forEach(function (p) { bar[p.c] = p.bc; }); } catch (e) {}
+  var g = {};
+  Object.keys(latest).forEach(function (k) {
+    var x = latest[k], key = x['單號'] + '|' + x['產品編號'];
+    var it = g[key] = g[key] || { sid: x['單號'], v: x['廠商'], c: String(x['產品編號']), n: x['品名'], kinds: [], notes: [], photos: [], who: [], time: '', st: {} };
+    var q = x['數量'], kind = x['異常類型'];
+    it.kinds.push(kind === '數量短少' ? '少 ' + q + ' 件' : kind === '數量超收' ? '多 ' + q + ' 件' : kind + ' ' + q + ' 件');
+    if (x['說明'] && it.notes.indexOf(x['說明']) < 0) it.notes.push(x['說明']);
+    String(x['照片'] || '').split(/\s+/).forEach(function (u) { if (u && it.photos.indexOf(u) < 0) it.photos.push(u); });
+    if (x['回報人'] && it.who.indexOf(x['回報人']) < 0) it.who.push(x['回報人']);
+    if (String(x['回報時間']) > it.time) it.time = String(x['回報時間']);
+    it.st[x['處理狀態']] = 1;
+  });
+  var rows = Object.keys(g).map(function (k) { return g[k]; })
+    .sort(function (a, b) { return (a.v + a.sid).localeCompare(b.v + b.sid) || a.c.localeCompare(b.c); })
+    .map(function (it) {
+      var st = Object.keys(it.st);
+      return [it.sid, it.v, it.c, bar[it.c] || '', it.n, it.kinds.join('、'), it.notes.join('；'), it.photos.join(' '), it.who.join('、'),
+        it.time.replace('T', ' ').slice(0, 16), st.length === 1 ? st[0] : '待處理'];
+    });
+  replaceRows_('issueSum', function () { return false; }, rows, 3);
 }
 
 /* ============ 異常照片 ============ */
@@ -359,7 +412,7 @@ function savePhoto_(b) {
 // 新功能上線後，在編輯器執行一次：授權 Drive 與 Google 文件，建立照片與驗收單資料夾
 function authorizePhotos() {
   ensureIssuePhotoHeader_();
-  ensureHeader_('counts'); sheet_('receipts'); sheet_('docs');
+  ensureHeader_('counts'); sheet_('receipts'); sheet_('docs'); sheet_('log'); refreshIssueSummary_();
   var f = photoFolder_(), d = docsFolder_();
   var tmp = DocumentApp.create('授權測試（可刪除）'); DriveApp.getFileById(tmp.getId()).setTrashed(true);
   var msg = '照片資料夾：' + f.getUrl() + '；驗收單資料夾：' + d.getUrl();
@@ -427,6 +480,7 @@ function finalize_(id, person) {
   var sh = sheet_('sessions');
   sh.getRange(idx + 2, 11, 1, 4).setValues([['已確認', person || '', t, t]]);
   var res = { written: out.length };
+  log_('確認入帳', id, type + ' ' + s['地點'] + (s['目的地'] ? '→' + s['目的地'] : '') + (s['廠商'] ? ' ' + s['廠商'] : '') + '，寫入 ' + out.length + ' 筆異動');
   if (receipt) {
     var rsh = sheet_('receipts'), rs = rsh.getLastRow() + 1;
     if (receipt.rows.length) {
@@ -451,6 +505,7 @@ function reopen_(id) {
   });
   replaceRows_('docs', function (r) { return String(r[0]) !== String(id); }, [], 0);
   sheet_('sessions').getRange(idx + 2, 11, 1, 4).setValues([['進行中', '', '', nowIso_()]]);
+  log_('重新開啟', id, '撤回入帳與驗收單');
   return {};
 }
 
@@ -461,6 +516,8 @@ function deleteSession_(id) {
   replaceRows_('sessions', function (r) { return String(r[0]) !== String(id); }, [], 0);
   replaceRows_('scans', function (r) { return String(r[1]) !== String(id); }, [], 6);
   replaceRows_('issues', function (r) { return String(r[2]) !== String(id); }, [], 6);
+  log_('刪除作業單', id, '連同掃描紀錄與異常回報');
+  refreshIssueSummary_();
   return { deleted: id };
 }
 
