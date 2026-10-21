@@ -205,7 +205,7 @@ async function loadRemote(id) {
   if (!API || !pin) return;
   try {
     const j = await apiGet({ a: "session", id });
-    remote[id] = { sheets: j.sheets || {}, issues: j.issues || [], book: j.book || null, at: nowIso() };
+    remote[id] = { sheets: j.sheets || {}, issues: j.issues || [], book: j.book || null, breakdown: j.breakdown || null, lastCount: j.lastCount || null, doc: j.doc || null, at: nowIso() };
     if (j.session) { const s = fromRow(j.session); if (!sessions[id] || !sessions[id]._local) sessions[id] = s; else sessions[id].status = s.status; }
     LS.set("remote", remote); saveLocal(); online = true;
   } catch (e) { if (e instanceof TypeError) online = false; }
@@ -830,7 +830,7 @@ function bindSession(s) {
 }
 
 /* ---- 結果與入帳 ---- */
-const ST = { ok: ["ok", "相符"], short: ["warn", "短少"], over: ["bad", "多出"], none: ["", "未掃到"], counted: ["ok", "已記錄"], extra: ["info", "非應收品項"], unknown: ["bad", "未知條碼"] };
+const ST = { ok: ["ok", "相符"], short: ["warn", "短少"], over: ["bad", "多出"], none: ["", "未掃到"], counted: ["ok", "已記錄"], extra: ["info", "非應收品項"], unknown: ["bad", "未知條碼"], zero: ["", "已售完"] };
 function resultRows(s) {
   const t = totals(view.id), rows = [], seenC = new Set();
   const book = remote[view.id] && remote[view.id].book;
@@ -842,11 +842,13 @@ function resultRows(s) {
       rows.push({ p, qty, ref, st: qty === ref ? "ok" : qty === 0 ? "none" : qty < ref ? "short" : "over", g });
     }
   } else if (s.type === "count" && book) {
-    for (const [code, b] of Object.entries(book)) {
+    const bd = (remote[view.id] && remote[view.id].breakdown) || {};
+    const codes = new Set(Object.keys(book).concat(Object.keys(bd).filter(c => Object.values(bd[c]).some(v => v))));
+    for (const code of codes) {
       const g = t.get(code); seenC.add(code);
       const p = byCode.get(code) || { c: code, n: "（主檔已無此品項）", b: "", v: "" };
-      const qty = g ? g.qty : 0;
-      rows.push({ p, qty, ref: b, st: qty === b ? "ok" : qty === 0 ? "none" : qty < b ? "short" : "over", g });
+      const qty = g ? g.qty : 0, b = book[code] || 0;
+      rows.push({ p, qty, ref: b, bd: bd[code], st: qty === b ? (b ? "ok" : "zero") : qty === 0 ? "none" : qty < b ? "short" : "over", g });
     }
   }
   for (const [code, g] of t) {
@@ -854,12 +856,14 @@ function resultRows(s) {
     const p = byCode.get(code);
     const unknown = !p;
     const ref = s.type === "count" && book ? 0 : null;
-    rows.push({ p: p || { c: code.replace(/^\?/, ""), n: "未知條碼", b: "", v: "" }, qty: g.qty, ref,
+    rows.push({ p: p || { c: code.replace(/^\?/, ""), n: "未知條碼", b: "", v: "" }, qty: g.qty, ref, bd: null,
       st: unknown ? "unknown" : s.type === "receive" ? "extra" : (ref === 0 ? "over" : "counted"), g });
   }
   return rows.map(r => Object.assign(r, { zones: r.g ? r.g.zones : {}, people: r.g ? [...r.g.people] : [] }));
 }
+const BD_COLS = [["open", "上次盤點"], ["recv", "＋進貨"], ["tin", "＋調入"], ["tout", "−調出"], ["ret", "−退貨"], ["sales", "−銷售"]];
 function resultInner(s) {
+  const isCount = s.type === "count";
   const rows = resultRows(s), hasRef = s.type === "receive" || (s.type === "count" && remote[view.id] && remote[view.id].book);
   const total = rows.reduce((a, x) => a + x.qty, 0);
   const keys = [...new Set(rows.map(r => r.st))];
@@ -879,7 +883,7 @@ function resultInner(s) {
     ${keys.map(k => `<div class="stat"><span class="small muted">${ST[k][1]}</span><b>${rows.filter(r => r.st === k).length}</b></div>`).join("")}
   </section>
   ${s.type === "count" && !(remote[view.id] && remote[view.id].book) ? `<div class="note">連上網路後會顯示帳面數並比對。</div>` : ""}
-  ${s.type === "count" ? `<div class="note">帳面數 = 驗收 ± 調撥 − 退貨 − POS 銷售 ± 上次盤差。POS 銷售要先貼到試算表「POS銷售」分頁，比對才會準。</div>` : ""}
+  ${s.type === "count" ? `<div class="note">應有 = 上次盤點 ＋ 進貨 ＋ 調入 − 調出 − 退貨 − POS 銷售。${(remote[view.id] && remote[view.id].lastCount) ? `上次盤點是 ${esc(remote[view.id].lastCount.date)}。` : "這個地點還沒有盤點過，從第一筆進貨開始算。"}POS 銷售要先貼到試算表「POS銷售」分頁，差異才會準。</div>` : ""}
   <section class="panel" style="gap:8px">
     <div class="row"><h3 class="grow">參與紀錄</h3><button class="ghost sm" id="refresh">重新整理</button></div>
     ${sh.length ? sh.map(x => `<div class="row small"><span class="grow">${esc(x.person || "未具名")} · ${esc(x.zone)}</span><span class="mono">${Object.values(x.counts || {}).reduce((a, b) => a + b, 0)} 件</span><span class="muted">${esc(fmt(x.updatedAt))}</span></div>`).join("") : `<p class="small muted" style="margin:0">還沒有人開始掃描。</p>`}
@@ -889,17 +893,27 @@ function resultInner(s) {
     <button aria-pressed="${resultFilter === "all"}" data-f="all">全部 ${rows.length}</button>
     ${keys.map(k => `<button aria-pressed="${resultFilter === k}" data-f="${k}">${ST[k][1]} ${rows.filter(r => r.st === k).length}</button>`).join("")}
   </div>
-  <div class="tablewrap"><table>
-    <thead><tr><th>品項</th><th>區域</th><th class="num">本次</th>${hasRef ? `<th class="num">${s.type === "receive" ? "應收" : "帳面"}</th><th class="num">差異</th>` : ""}<th>狀態</th></tr></thead>
+  ${isCount && hasRef ? `<section class="panel" style="gap:0"><div class="list">${shown.map(x => {
+      const b = x.bd || {}, d = x.qty - (x.ref || 0);
+      const parts = BD_COLS.filter(([k]) => k === "open" || b[k]).map(([k, l]) => `${k === "open" ? "上次" : l} ${b[k] || 0}`).join("　");
+      return `<div class="item" style="align-items:flex-start">
+        <span class="grow"><span class="name">${esc(x.p.n)}</span><br><span class="small mono muted">${esc(x.p.c)}</span><br>
+        <span class="small mono">${parts}　＝ 應有 <b>${x.ref ?? 0}</b></span></span>
+        <span style="text-align:right;display:flex;flex-direction:column;align-items:flex-end;gap:4px"><span class="mono">實盤 <b>${x.qty}</b></span>
+        <span class="mono small">${d > 0 ? "+" : ""}${d}</span><span class="chip ${ST[x.st][0]}">${ST[x.st][1]}</span></span></div>`;
+    }).join("") || `<p class="muted">沒有品項。</p>`}</div></section>` : `<div class="tablewrap"><table>
+    <thead><tr><th>品項</th>${isCount && hasRef ? BD_COLS.map(([, l]) => `<th class="num">${l}</th>`).join("") + `<th class="num">應有</th><th class="num">實盤</th>` : `<th>區域</th><th class="num">本次</th>`}${hasRef && !isCount ? `<th class="num">應收</th>` : ""}${hasRef ? `<th class="num">差異</th>` : ""}<th>狀態</th></tr></thead>
     <tbody>${shown.map(x => `<tr>
       <td><span class="name">${esc(x.p.n)}</span><br><span class="small mono muted">${esc(x.p.c)}</span></td>
-      <td class="small">${Object.entries(x.zones).map(([z, q]) => `${esc(z)} ${q}`).join("<br>") || "—"}</td>
-      <td class="num">${x.qty}</td>
-      ${hasRef ? `<td class="num">${x.ref ?? "—"}</td><td class="num">${x.ref == null ? "—" : (x.qty - x.ref > 0 ? "+" : "") + (x.qty - x.ref)}</td>` : ""}
+      ${isCount && hasRef ? BD_COLS.map(([k]) => `<td class="num">${x.bd ? x.bd[k] || "" : ""}</td>`).join("") + `<td class="num"><b>${x.ref ?? 0}</b></td><td class="num">${x.qty}</td>`
+        : `<td class="small">${Object.entries(x.zones).map(([z, q]) => `${esc(z)} ${q}`).join("<br>") || "—"}</td><td class="num">${x.qty}</td>`}
+      ${hasRef && !isCount ? `<td class="num">${x.ref ?? "—"}</td>` : ""}
+      ${hasRef ? `<td class="num">${x.ref == null ? "—" : (x.qty - x.ref > 0 ? "+" : "") + (x.qty - x.ref)}</td>` : ""}
       <td><span class="chip ${ST[x.st][0]}">${ST[x.st][1]}</span></td></tr>`).join("") || `<tr><td colspan="6" class="muted">沒有品項。</td></tr>`}</tbody>
-  </table></div>
+  </table></div>`}
   <section class="row"><button class="grow" id="copy">複製表格</button></section>
   ${locked(s) ? `<section class="panel"><p style="margin:0">已在 ${esc(fmt(s.confirmedAt))} 由 ${esc(s.confirmedBy || "")} 確認入帳。</p>
+      ${remote[view.id] && remote[view.id].doc ? `<a class="primary" href="${esc(remote[view.id].doc.url)}" target="_blank" rel="noopener" style="display:block;text-align:center;padding:12px;border-radius:8px;background:var(--accent);color:var(--accent-fg);text-decoration:none;font-weight:700">開啟驗收單 PDF</a><p class="small muted" style="margin:0">PDF 存在 Drive「點收盤點_驗收單」資料夾，可以直接轉給財務。</p>` : ""}
       ${confirmAsk ? `<div class="confirm"><b>確定要重新開啟？</b><span class="small">這張單寫入的庫存異動會被撤回，可以繼續修改後再確認一次。</span><div class="row"><button id="no">取消</button><button class="danger grow" id="yesReopen">重新開啟</button></div></div>` : `<button class="danger" id="reopen">重新開啟</button>`}</section>`
     : `<section class="panel">
       ${pending ? `<div class="note warn">還有 ${pending} 筆掃描沒有上傳，連上網路後再確認入帳。</div>` : ""}
@@ -931,7 +945,7 @@ function bindResult(s) {
       if (queue.length) throw new Error("還有資料沒有上傳");
       const j = await apiPost({ a: "finalize", id: s.id, person });
       s.status = "已確認"; s.confirmedBy = person; s.confirmedAt = nowIso(); delete s._local; saveLocal();
-      toast(j.already ? "這張單之前已經入帳" : `已入帳，寫入 ${j.written} 筆異動`);
+      toast(j.already ? "這張單之前已經入帳" : j.docError ? `已入帳，但${j.docError}` : `已入帳，寫入 ${j.written} 筆異動${j.doc ? "，驗收單 PDF 已產生" : ""}`);
       confirmAsk = false; await loadRemote(s.id); refreshReceived(); render();
     } catch (e) { toast("入帳失敗：" + (e instanceof TypeError ? "沒有網路" : e.message)); yes.disabled = false; yes.textContent = "確認入帳"; }
   };
