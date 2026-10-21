@@ -234,12 +234,12 @@ function totals(id) {
 
 /* ================= 畫面 ================= */
 let view = { name: "home" };
-let lastHit = null, issueOpen = false, resultFilter = "all", confirmAsk = false, deleteAsk = false, issueFilter = "open";
+let expectFilter = "", lastHit = null, issueOpen = false, resultFilter = "all", confirmAsk = false, deleteAsk = false, issueFilter = "open";
 const app = document.getElementById("app");
 function toast(msg) { const t = document.getElementById("toast"); t.textContent = msg; t.hidden = false; clearTimeout(toast._t); toast._t = setTimeout(() => t.hidden = true, 2800); }
 function go(v) {
   stopCamera();
-  view = v; lastHit = null; issueOpen = false; confirmAsk = false; deleteAsk = false; resultFilter = "all";
+  view = v; expectFilter = ""; lastHit = null; issueOpen = false; confirmAsk = false; deleteAsk = false; resultFilter = "all";
   render(); window.scrollTo(0, 0);
   if (v.name === "session") loadRemote(v.id).then(() => { if (view.name === "session" && view.id === v.id) render(true); });
   if (v.name === "issues") loadIssues();
@@ -401,14 +401,18 @@ function scanHTML(s) {
       <label style="flex:2">區域<input id="zone" list="zonelist" value="${esc(view.zone)}"><datalist id="zonelist">${ZONES.map(z => `<option value="${z}">`).join("")}</datalist></label>
       <label>操作人（必填）<input id="who2" value="${esc(person)}" placeholder="你的名字"></label>
     </div>
+    ${s.type === "receive" ? `
+    <input id="flt" value="${esc(expectFilter)}" placeholder="找品項：品名、產品編號或廠商條碼" autocomplete="off">
+    <span class="small muted">只會在 ${esc(s.vendor)} 的品項裡找。條碼打前幾碼或後幾碼都可以，品名可以打多個關鍵字。找到後直接按「相符 ✓」或「有問題」。</span>
+  </section>` : `
     <form id="manual" class="row" autocomplete="off">
       <input id="code" class="grow" placeholder="搜尋品名、產品編號或廠商條碼" style="flex:1;min-width:0">
       <button type="submit">加入</button>
     </form>
-    <span class="small muted">條碼打前幾碼或後幾碼都可以；品名可以打多個關鍵字，例如「抱枕套 鐵線蕨」。也可以用藍牙掃描槍刷條碼。</span>
+    <span class="small muted">${s.type === "return" ? `只會在 ${esc(s.vendor)} 的品項裡找。` : ""}條碼打前幾碼或後幾碼都可以；品名可以打多個關鍵字，例如「抱枕套 鐵線蕨」。</span>
     <div id="sugg" class="list"></div>
     <div id="hit"></div>
-  </section>
+  </section>`}
   ${s.type === "receive" ? `<section class="panel"><div class="row"><h3 class="grow">應收清單（${esc(s.vendor)}）</h3><span class="small muted mono" id="recvSum"></span></div><div id="expect" class="list"></div></section>
   <details class="panel"><summary style="cursor:pointer"><h3 id="mineTitle" style="display:inline"></h3></summary><div id="mine" class="list"></div></details>`
   : `<section class="panel">
@@ -531,10 +535,16 @@ const shortKind = k => ({ "外箱或商品破損": "破損", "送錯款式或顏
 function expectHTML(s) {
   const t = totals(view.id);
   let gotSum = 0, needSum = 0;
-  const rows = P.filter(p => p.v === s.vendor).map(p => {
+  const pool = P.filter(p => p.v === s.vendor);
+  const show = expectFilter.trim() ? new Set(suggest(expectFilter, pool, 9999).map(x => x.p.c)) : null;
+  let shown = 0, total = 0;
+  const rows = pool.map(p => {
     const g = (t.get(p.c) || { qty: 0 }).qty, need = remainingFor(s, p.c, g);
     gotSum += g; needSum += need;
     if (!need && !g) return "";
+    total++;
+    if (show && !show.has(p.c)) return "";
+    shown++;
     const st = g === need ? ["ok", "相符"] : g === 0 ? ["", "未點"] : g < need ? ["warn", `短 ${need - g}`] : ["bad", `多 ${g - need}`];
     const head = `<span class="grow"><span class="name">${esc(p.n)}</span><br><span class="small mono muted">${p.c}${p.bc ? "" : " · 需貼六福標"}${need !== p.q ? ` · 訂 ${p.q}，先前已收 ${p.q - need}` : ""}</span></span>`;
     const kinds = issuesFor(p.c);
@@ -564,7 +574,9 @@ function expectHTML(s) {
     return `<div class="item">${head}<span class="mono small">${g}/${need}</span><span class="chip ${st[0]}">${st[1]}</span>${tags}${actions}</div>`;
   });
   const sum = document.getElementById("recvSum"); if (sum) sum.textContent = `${gotSum} / ${needSum}`;
-  return rows.join("") || `<p class="small muted">料號表裡沒有這家廠商的品項。</p>`;
+  const head = show ? `<div class="row small" style="padding:6px 0"><span class="grow muted">找到 ${shown} / ${total} 項</span><button class="sm ghost" data-clearflt="1">顯示全部</button></div>` : "";
+  if (show && !shown) return head + `<p class="small muted">${esc(s.vendor)} 沒有符合「${esc(expectFilter)}」的品項。</p>`;
+  return head + (rows.join("") || `<p class="small muted">料號表裡沒有這家廠商的品項。</p>`);
 }
 function refreshScanParts() {
   const s = sessions[view.id];
@@ -605,6 +617,7 @@ function bindMine() {
 }
 function bindExpect() {
   const s = sessions[view.id];
+  document.querySelectorAll("[data-clearflt]").forEach(b => b.onclick = () => { expectFilter = ""; const f = document.getElementById("flt"); if (f) f.value = ""; refreshScanParts(); });
   const myCount = code => { const sh = sheets[sheetKey(view.id, view.zone)]; return (sh && sh.counts[code]) || 0; };
   document.querySelectorAll("[data-match]").forEach(b => b.onclick = () => {
     const code = b.dataset.match, need = +b.dataset.need;
@@ -654,15 +667,17 @@ function bindExpect() {
 }
 
 /* ---- 輸入比對：前幾碼、後幾碼都可以 ---- */
-function suggest(raw) {
+function suggest(raw, pool, limit) {
+  pool = pool || P;
   const v = String(raw || "").trim().replace(/\s+/g, "");
   const terms = String(raw || "").trim().toLowerCase().split(/\s+/).filter(Boolean);
   const isCode = /^\d+$/.test(v);
   if (isCode ? v.length < 3 : !terms.length) return [];
   const out = [];
-  for (const p of P) {
+  for (const p of pool) {
     if (!isCode) {
-      const h = (p.n + " " + p.b + " " + p.c + " " + (p.bc || "")).toLowerCase();
+      // 只在同一家廠商裡找時不比對品牌（每個品項都一樣，會全部符合）
+      const h = (p.n + " " + (pool === P ? p.b + " " : "") + p.c + " " + (p.bc || "")).toLowerCase();
       if (terms.every(t => h.includes(t))) out.push({ p, rank: 4, how: "品名相符" });
       continue;
     }
@@ -676,7 +691,7 @@ function suggest(raw) {
     }
     if (rank < 9) out.push({ p, rank, how });
   }
-  return out.sort((a, b) => a.rank - b.rank).slice(0, isCode ? 8 : 20);
+  return out.sort((a, b) => a.rank - b.rank).slice(0, limit || (isCode ? 8 : 20));
 }
 const hl = (k, v) => { v = String(v || "").trim(); const i = v ? String(k).indexOf(v) : -1; return i < 0 ? esc(k) : esc(k.slice(0, i)) + "<b>" + esc(k.slice(i, i + v.length)) + "</b>" + esc(k.slice(i + v.length)); };
 
@@ -803,11 +818,18 @@ function bindSession(s) {
   const z = document.getElementById("zone");
   z.onchange = () => { view.zone = z.value.trim() || "整區"; LS.set("zone." + view.id, view.zone); lastHit = null; refreshScanParts(); };
   const w = document.getElementById("who2"); w.onchange = () => { person = w.value.trim(); LS.set("person", person); };
+  const flt = document.getElementById("flt");
+  if (flt) {
+    flt.oninput = () => { expectFilter = flt.value; const e = document.getElementById("expect"); if (e) { e.innerHTML = expectHTML(s); bindExpect(); bindPhotoBoxes(e); } };
+    refreshScanParts();
+    return;
+  }
+  const pool = s.type === "return" && s.vendor ? P.filter(p => p.v === s.vendor) : P;
   const form = document.getElementById("manual"), ci = document.getElementById("code");
   const sugg = document.getElementById("sugg");
   const clearSugg = () => { sugg.innerHTML = ""; };
   ci.oninput = () => {
-    const m = suggest(ci.value);
+    const m = suggest(ci.value, pool);
     if (!m.length) { sugg.innerHTML = ci.value.trim().length >= 2 ? `<p class="small muted" style="margin:0">沒有符合的品項。</p>` : ""; return; }
     sugg.innerHTML = m.map(({ p, how }) => `<div class="item"><span class="grow"><span class="name">${esc(p.n)}</span><br><span class="small mono muted">${hl(p.c, ci.value)}${p.bc ? " · " + hl(p.bc, ci.value) : ""} · ${how}</span></span><button class="sm" data-pick="${p.c}">＋1</button></div>`).join("");
     sugg.querySelectorAll("[data-pick]").forEach(b => b.onclick = () => { handleCode(b.dataset.pick, "manual"); ci.value = ""; clearSugg(); ci.focus(); });
@@ -816,7 +838,7 @@ function bindSession(s) {
     e.preventDefault();
     const v = ci.value.trim(); if (!v) return;
     if (lookup(v)) { handleCode(v, "manual"); ci.value = ""; clearSugg(); ci.focus(); return; }
-    const m = suggest(v);
+    const m = suggest(v, pool);
     if (m.length === 1) { handleCode(m[0].p.c, "manual"); ci.value = ""; clearSugg(); ci.focus(); return; }
     if (m.length > 1) { toast(`有 ${m.length} 個品項符合，請從下方選一個`); return; }
     handleCode(v, "manual"); ci.value = ""; clearSugg();
