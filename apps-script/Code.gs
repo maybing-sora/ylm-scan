@@ -541,12 +541,22 @@ var AUTO_NOTE_ = '確認入帳時自動標示';
 // 確認入帳時：數量和進貨單不同、但沒人回報的品項，自動建立異常（沒掃到＝未到貨）
 function autoQtyIssues_(id, s, totals, P, person) {
   var before = receivedTotals_(), have = {};
-  listIssues_().forEach(function (x) {
-    if (String(x['單號']) !== String(id) || x['處理狀態'] === '已撤回') return;
-    var k = x['異常類型'];
-    if (k === '數量短少' || k === '數量超收' || k === '未到貨') have[String(x['產品編號'])] = 1;
-  });
   var n = 0, now = nowIso_();
+  // 之前驗收單自動標示的「未到貨／短少」，這次補到齊了就自動結案
+  listIssues_().forEach(function (x) {
+    var c = String(x['產品編號']);
+    if (String(x['單號']) === String(id) || x['說明'] !== AUTO_NOTE_ || x['處理狀態'] === '已撤回' || x['處理狀態'] === '已解決') return;
+    if (x['異常類型'] !== '未到貨' && x['異常類型'] !== '數量短少') return;
+    var p = P[c]; if (!p || !totals[c]) return;
+    var ordered = Math.max(0, (p.q || 0) - (before[c] || 0));
+    if (totals[c] >= ordered) saveIssue_({ id: x['編號'], status: '已解決', resolution: '已於 ' + id + ' 補到貨 ' + totals[c] + ' 件' });
+  });
+  // 已有數量類回報的品項不再重複標示：這張單有人回報的，或之前的單還沒結案的
+  listIssues_().forEach(function (x) {
+    var k = x['異常類型'], st = x['處理狀態'];
+    if (k !== '數量短少' && k !== '數量超收' && k !== '未到貨') return;
+    if (String(x['單號']) === String(id) ? st !== '已撤回' : (st === '待處理' || st === '已通知廠商')) have[String(x['產品編號'])] = 1;
+  });
   Object.keys(P).forEach(function (c) {
     var p = P[c];
     if (p.v !== s['廠商'] || have[c]) return;
