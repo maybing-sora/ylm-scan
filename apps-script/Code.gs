@@ -689,9 +689,7 @@ function makeReceiptPdf_(id, s, receipt, person, t) {
       });
     });
   }
-  body.appendParagraph('').setSpacingBefore(16);
-  styleTable_(body.appendTable([['驗收人簽名', '商品開發簽名', '財務簽名'], ['\n\n', '\n\n', '\n\n']]), 10, true);
-  body.appendParagraph('本單由點收盤點工具於確認入帳時產生。').setFontSize(8).setForegroundColor('#666666');
+  body.appendParagraph('本單由點收盤點工具於確認入帳時產生，驗收人與確認入帳人即為確認紀錄，不另簽名。').setFontSize(8).setForegroundColor('#666666').setSpacingBefore(12);
   doc.saveAndClose();
   var docFile = DriveApp.getFileById(doc.getId());
   var pdf = docsFolder_().createFile(docFile.getAs('application/pdf').setName(name + '.pdf'));
