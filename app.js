@@ -79,6 +79,50 @@ function enqueue(op, key, body) {
   queue.push({ op, key, body });
   saveLocal(); scheduleFlush();
 }
+/* ---- 異常照片：先存手機（IndexedDB），上傳時一併送到試算表的 Drive 資料夾 ---- */
+const PHOTO_REQUIRED = ["外箱或商品破損", "送錯款式或顏色", "缺中文標示"];
+const MAX_PHOTOS = 3;
+let photoUrls = LS.get("photoUrls", {}); // photoId -> Drive 網址
+let idbP = null;
+function idb() {
+  if (!idbP) idbP = new Promise((res, rej) => {
+    try {
+      const r = indexedDB.open("ylm2", 1);
+      r.onupgradeneeded = () => r.result.createObjectStore("photos");
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    } catch (e) { rej(e); }
+  });
+  return idbP;
+}
+async function idbOp(mode, fn) {
+  const d = await idb();
+  return new Promise((res, rej) => { const t = d.transaction("photos", mode), st = t.objectStore("photos"), r = fn(st); t.oncomplete = () => res(r && r.result); t.onerror = () => rej(t.error); });
+}
+const photoPut = (id, dataUrl) => idbOp("readwrite", st => st.put(dataUrl, id));
+const photoGet = id => idbOp("readonly", st => st.get(id));
+const photoDel = id => idbOp("readwrite", st => st.delete(id)).catch(() => {});
+// 手機照片壓縮成長邊 1280px 的 JPEG（約 150–300KB）
+async function compressPhoto(file) {
+  let bmp;
+  try { bmp = await createImageBitmap(file, { imageOrientation: "from-image" }); } catch (e) { bmp = await createImageBitmap(file); }
+  const k = Math.min(1, 1280 / Math.max(bmp.width, bmp.height));
+  const cv = document.createElement("canvas"); cv.width = Math.round(bmp.width * k); cv.height = Math.round(bmp.height * k);
+  cv.getContext("2d").drawImage(bmp, 0, 0, cv.width, cv.height);
+  return cv.toDataURL("image/jpeg", 0.72);
+}
+async function uploadPhotos(issue) {
+  const urls = [];
+  for (const id of issue.photoIds || []) {
+    if (!photoUrls[id]) {
+      const data = await photoGet(id);
+      if (!data) continue; // 找不到就略過（例如手機資料被清掉）
+      const j = await apiPost({ a: "savePhoto", photoId: id, data, desc: `${issue.vendor || ""} ${issue.name || ""} ${issue.kind || ""}` });
+      photoUrls[id] = j.url; LS.set("photoUrls", photoUrls);
+    }
+    urls.push(photoUrls[id]);
+  }
+  return urls;
+}
 function scheduleFlush(ms) { clearTimeout(flushTimer); flushTimer = setTimeout(flush, ms ?? 1500); setSync(); }
 async function flush() {
   if (flushing || !queue.length || !API) { setSync(); return; }
@@ -86,7 +130,21 @@ async function flush() {
   try {
     while (queue.length) {
       const q = queue[0];
+      if (q.op === "saveIssue" && q.body.issue && q.body.issue.photoIds && q.body.issue.photoIds.length) {
+        const urls = await uploadPhotos(q.body.issue);
+        q.body.issue.photos = [...new Set(String(q.body.issue.photos || "").split(/\s+/).filter(Boolean).concat(urls))].join(" ");
+      }
       await apiPost(Object.assign({ a: q.op }, q.body));
+      if (q.op === "saveIssue" && q.body.issue && q.body.issue.photos) {
+        // 本機的異常紀錄也記上照片網址，之後重新填寫時才能沿用
+        const iss = q.body.issue, rr = remote[iss.sessionId];
+        const row = rr && (rr.issues || []).find(i => i["編號"] === iss.id);
+        if (row) { row["照片"] = iss.photos; LS.set("remote", remote); }
+      }
+      if (q.op === "saveIssue" && q.body.issue && q.body.issue.photoIds) {
+        const still = new Set(queue.slice(1).flatMap(x => (x.body.issue && x.body.issue.photoIds) || []));
+        q.body.issue.photoIds.forEach(id => { if (!still.has(id)) photoDel(id); });
+      }
       if (q.op === "saveSession" && sessions[q.key]) delete sessions[q.key]._local;
       queue.shift(); saveLocal();
     }
@@ -368,10 +426,63 @@ function hitHTML() {
     ${issueOpen ? issueFormHTML(p) : `<div class="row"><button class="sm" id="openIssue">回報異常</button></div>`}
   </div>`;
 }
+// 拍照區塊：key 用來區分是哪個表單
+const formPhotos = {}; // key -> [{id, dataUrl}]
+function photoBoxHTML(key) {
+  const list = formPhotos[key] || [];
+  return `<div class="photoBox" data-pkey="${esc(key)}" style="display:flex;flex-direction:column;gap:6px">
+    <span class="small muted">照片（破損、送錯款、缺中文標示必拍，最多 ${MAX_PHOTOS} 張）</span>
+    <div class="row" style="gap:6px">
+      ${list.map((x, i) => `<span style="position:relative;display:inline-block"><img src="${x.dataUrl}" alt="照片 ${i + 1}" style="width:64px;height:64px;object-fit:cover;border-radius:6px;border:1px solid var(--line)"><button class="sm" data-pdel="${i}" aria-label="刪除照片" style="position:absolute;top:-8px;right:-8px;padding:0 6px;border-radius:999px">×</button></span>`).join("")}
+      ${list.length < MAX_PHOTOS ? `<button class="sm" data-padd="1">＋ 拍照</button>` : ""}
+    </div>
+  </div>`;
+}
+let photoTarget = null;
+// 只重畫照片區塊，表單其他欄位（數量、勾選、說明）不會被清掉
+function rerenderBox(key) {
+  const box = [...document.querySelectorAll(".photoBox")].find(b => b.dataset.pkey === key); if (!box) return;
+  const tmp = document.createElement("div"); tmp.innerHTML = photoBoxHTML(key);
+  const nb = tmp.firstElementChild; box.replaceWith(nb); bindPhotoBoxes(nb.parentElement);
+}
+function bindPhotoBoxes(root) {
+  (root || document).querySelectorAll(".photoBox").forEach(box => {
+    const key = box.dataset.pkey;
+    box.querySelectorAll("[data-pdel]").forEach(b => b.onclick = () => { (formPhotos[key] || []).splice(+b.dataset.pdel, 1); rerenderBox(key); });
+    const add = box.querySelector("[data-padd]");
+    if (add) add.onclick = () => {
+      photoTarget = { key };
+      let inp = document.getElementById("photoIn");
+      if (!inp) { inp = document.createElement("input"); inp.type = "file"; inp.accept = "image/*"; inp.capture = "environment"; inp.id = "photoIn"; inp.hidden = true; document.body.appendChild(inp); }
+      inp.value = "";
+      inp.onchange = async () => {
+        const f = inp.files && inp.files[0]; if (!f || !photoTarget) return;
+        try {
+          const dataUrl = await compressPhoto(f);
+          const arr = formPhotos[photoTarget.key] = formPhotos[photoTarget.key] || [];
+          if (arr.length < MAX_PHOTOS) arr.push({ id: "P" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), dataUrl });
+          rerenderBox(photoTarget.key);
+        } catch (e) { toast("照片讀取失敗，請再拍一次"); }
+      };
+      inp.click();
+    };
+  });
+}
+// 儲存時把照片寫進手機暫存，回傳照片編號
+async function stashPhotos(key) {
+  const arr = formPhotos[key] || [], ids = [];
+  for (const x of arr) {
+    try { await photoPut(x.id, x.dataUrl); ids.push(x.id); }
+    catch (e) { toast("手機無法暫存照片，請確認不是無痕模式"); throw e; }
+  }
+  delete formPhotos[key];
+  return ids;
+}
 function issueFormHTML(p) {
   return `<div class="panel" style="gap:8px">
     <label>異常類型<select id="iKind">${ISSUE_KINDS.map(k => `<option>${k}</option>`).join("")}</select></label>
     <div class="grid2"><label>數量<input id="iQty" type="number" min="0" value="1"></label><label>說明<input id="iNote" placeholder="例：外箱壓破，2 件玻璃杯裂"></label></div>
+    ${photoBoxHTML("hit-" + p.c)}
     <div class="row"><button class="sm" id="cancelIssue">取消</button><button class="sm primary grow" id="sendIssue">送出回報</button></div>
   </div>`;
 }
@@ -397,6 +508,20 @@ function issuesFor(code) {
   const r = remote[view.id]; if (!r || !r.issues) return [];
   return [...new Set(r.issues.filter(i => String(i["產品編號"]) === code && i["處理狀態"] !== WITHDRAWN).map(i => i["異常類型"]))];
 }
+function openIssuesFor(code) {
+  const r = remote[view.id]; if (!r || !r.issues) return [];
+  return r.issues.filter(i => String(i["產品編號"]) === code && i["處理狀態"] === "待處理");
+}
+// 之前回報的照片（已上傳的網址 + 還在手機等上傳的照片編號），重新填寫時沿用
+function prevPhotos(code) {
+  const prev = openIssuesFor(code), urls = new Set(), ids = new Set();
+  prev.forEach(i => {
+    String(i["照片"] || "").split(/\s+/).filter(Boolean).forEach(u => urls.add(u));
+    const q = queue.find(x => x.op === "saveIssue" && x.key === i["編號"]);
+    ((q && q.body.issue && q.body.issue.photoIds) || []).forEach(id => ids.add(id));
+  });
+  return { urls: [...urls], ids: [...ids] };
+}
 const shortKind = k => ({ "外箱或商品破損": "破損", "送錯款式或顏色": "送錯款", "缺條碼或吊牌（已補標）": "已補標", "缺中文標示": "缺中文標示" }[k] || k);
 function expectHTML(s) {
   const t = totals(view.id);
@@ -410,18 +535,21 @@ function expectHTML(s) {
     const kinds = issuesFor(p.c);
     const tags = kinds.filter(k => !k.startsWith("數量")).map(k => `<span class="chip bad">${esc(shortKind(k))}</span>`).join("");
     if (editing.has(p.c)) {
-      const v = g || need;
+      const v = g || need, prev = openIssuesFor(p.c), prevKinds = new Set(prev.map(i => i["異常類型"]));
+      const prevNote = (prev.find(i => i["說明"]) || {})["說明"] || "", pp = prevPhotos(p.c), prevN = pp.urls.length + pp.ids.length;
       return `<div class="item" style="flex-direction:column;align-items:stretch">
         <div class="row">${head}<span class="mono small">應收 ${need}</span></div>
         <label style="min-width:0">實收數量（實際收到的總數）<input type="number" min="0" inputmode="numeric" id="ed-${p.c}" value="${v}"></label>
         <div style="display:flex;flex-direction:column;gap:6px">
           <span class="small muted">其他問題（可複選；數量不對會自動回報，不用勾）</span>
-          ${OTHER_KINDS.map((k, i) => `<label style="flex-direction:row;align-items:center;gap:8px;color:var(--fg);min-width:0"><input type="checkbox" id="k${i}-${p.c}" style="width:auto"> ${k}</label>`).join("")}
+          ${OTHER_KINDS.map((k, i) => `<label style="flex-direction:row;align-items:center;gap:8px;color:var(--fg);min-width:0"><input type="checkbox" id="k${i}-${p.c}" ${prevKinds.has(k) ? "checked" : ""} style="width:auto"> ${k}</label>`).join("")}
         </div>
         <div class="grid2">
           <label style="min-width:0">有問題的件數<input type="number" min="1" inputmode="numeric" id="kq-${p.c}" value="1"></label>
-          <label style="min-width:0">說明（選填）<input id="note-${p.c}" placeholder="例：外箱壓破，玻璃杯裂 1 件"></label>
+          <label style="min-width:0">說明（選填）<input id="note-${p.c}" value="${esc(prevNote)}" placeholder="例：外箱壓破，玻璃杯裂 1 件"></label>
         </div>
+        ${prevN ? `<span class="small muted">之前已拍 ${prevN} 張照片，會一起保留。</span>` : ""}
+        ${photoBoxHTML("row-" + p.c)}
         <div class="row"><button class="sm" data-cancel="${p.c}">取消</button><button class="sm primary grow" data-save="${p.c}" data-need="${need}" data-got="${g}">儲存</button></div>
       </div>`;
     }
@@ -435,9 +563,9 @@ function expectHTML(s) {
 }
 function refreshScanParts() {
   const s = sessions[view.id];
-  const h = document.getElementById("hit"); if (h) { h.innerHTML = hitHTML(); bindHit(s); }
+  const h = document.getElementById("hit"); if (h) { h.innerHTML = hitHTML(); bindHit(s); bindPhotoBoxes(h); }
   const m = document.getElementById("mine"); if (m) { m.innerHTML = mineHTML(); bindMine(); }
-  const e = document.getElementById("expect"); if (e) { e.innerHTML = expectHTML(s); bindExpect(); }
+  const e = document.getElementById("expect"); if (e) { e.innerHTML = expectHTML(s); bindExpect(); bindPhotoBoxes(e); }
 }
 function bindHit(s) {
   const h = document.getElementById("hit");
@@ -445,12 +573,15 @@ function bindHit(s) {
   const qi = document.getElementById("hitQty"); if (qi) qi.onchange = () => { bump(lastHit.p.c, 0, +qi.value || 0); refreshScanParts(); };
   const u = document.getElementById("unk"); if (u) u.onclick = () => { bump("?" + lastHit.raw, 1); lastHit = null; toast("已記下未知條碼"); refreshScanParts(); };
   const oi = document.getElementById("openIssue"); if (oi) oi.onclick = () => { issueOpen = true; refreshScanParts(); };
-  const ci = document.getElementById("cancelIssue"); if (ci) ci.onclick = () => { issueOpen = false; refreshScanParts(); };
-  const si = document.getElementById("sendIssue"); if (si) si.onclick = () => {
-    const p = lastHit.p;
+  const ci = document.getElementById("cancelIssue"); if (ci) ci.onclick = () => { delete formPhotos["hit-" + lastHit.p.c]; issueOpen = false; refreshScanParts(); };
+  const si = document.getElementById("sendIssue"); if (si) si.onclick = async () => {
+    const p = lastHit.p, pkey = "hit-" + p.c, kind = document.getElementById("iKind").value;
+    if (PHOTO_REQUIRED.includes(kind) && !(formPhotos[pkey] || []).length) { toast(`「${shortKind(kind)}」需要拍照`); return; }
+    let photoIds = [];
+    try { photoIds = await stashPhotos(pkey); } catch (e) { return; }
     const issue = { id: "I" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5), sessionId: view.id, location: s.location, vendor: p.v,
       code: p.c, name: p.n, kind: document.getElementById("iKind").value, qty: +document.getElementById("iQty").value || 0,
-      note: document.getElementById("iNote").value.trim(), person, reportedAt: nowIso(), status: "待處理" };
+      note: document.getElementById("iNote").value.trim(), person, reportedAt: nowIso(), status: "待處理", photoIds };
     const r = remote[view.id] = remote[view.id] || { sheets: {}, issues: [] };
     r.issues = [toIssueRow(issue)].concat(r.issues || []); LS.set("remote", remote);
     enqueue("saveIssue", issue.id, { issue });
@@ -459,7 +590,7 @@ function bindHit(s) {
 }
 function toIssueRow(x) {
   return { "編號": x.id, "回報時間": x.reportedAt, "單號": x.sessionId, "地點": x.location, "廠商": x.vendor, "產品編號": x.code, "品名": x.name,
-    "異常類型": x.kind, "數量": x.qty, "說明": x.note, "回報人": x.person, "處理狀態": x.status, "處理備註": "" };
+    "異常類型": x.kind, "數量": x.qty, "說明": x.note, "回報人": x.person, "處理狀態": x.status, "處理備註": "", "照片": x.photos || "", "_pending": (x.photoIds || []).length };
 }
 function bindMine() {
   const m = document.getElementById("mine");
@@ -475,14 +606,19 @@ function bindExpect() {
     refreshScanParts();
   });
   document.querySelectorAll("[data-edit]").forEach(b => b.onclick = () => { editing.add(b.dataset.edit); refreshScanParts(); const i = document.getElementById("ed-" + b.dataset.edit); if (i) i.focus(); });
-  document.querySelectorAll("[data-cancel]").forEach(b => b.onclick = () => { editing.delete(b.dataset.cancel); refreshScanParts(); });
-  document.querySelectorAll("[data-save]").forEach(b => b.onclick = () => {
-    const code = b.dataset.save, need = +b.dataset.need, got = +b.dataset.got;
+  document.querySelectorAll("[data-cancel]").forEach(b => b.onclick = () => { delete formPhotos["row-" + b.dataset.cancel]; editing.delete(b.dataset.cancel); refreshScanParts(); });
+  document.querySelectorAll("[data-save]").forEach(b => b.onclick = async () => {
+    const code = b.dataset.save, need = +b.dataset.need, got = +b.dataset.got, pkey = "row-" + code;
+    const needPhoto = OTHER_KINDS.filter((k, i) => document.getElementById(`k${i}-${code}`).checked && PHOTO_REQUIRED.includes(k));
+    const pp = prevPhotos(code);
+    if (needPhoto.length && !(formPhotos[pkey] || []).length && !(pp.urls.length + pp.ids.length)) { toast(`「${needPhoto.map(shortKind).join("、")}」需要拍照`); return; }
     const raw = document.getElementById("ed-" + code).value.trim();
     if (raw === "") { toast("請填實收數量"); return; }
     const qty = Math.max(0, Math.round(+raw || 0));
     const others = got - myCount(code); // 其他人或其他區域已記的數量
     if (qty < others) { toast(`其他人已記 ${others} 件，實收不能小於這個數字`); return; }
+    let photoIds = [];
+    try { photoIds = pp.ids.concat(await stashPhotos(pkey)); } catch (e) { return; }
     if (!bump(code, 0, qty - others)) return;
     const p = byCode.get(code), note = document.getElementById("note-" + code).value.trim();
     const kq = Math.max(1, Math.round(+document.getElementById("kq-" + code).value || 1));
@@ -499,7 +635,9 @@ function bindExpect() {
     });
     list.forEach((x, n) => {
       const issue = { id: "I" + Date.now().toString(36) + n + Math.random().toString(36).slice(2, 5), sessionId: view.id, location: s.location, vendor: p ? p.v : s.vendor,
-        code, name: p ? p.n : code, kind: x.kind, qty: x.qty, note, person, reportedAt: nowIso(), status: "待處理" };
+        code, name: p ? p.n : code, kind: x.kind, qty: x.qty, note, person, reportedAt: nowIso(), status: "待處理",
+        photoIds: x.kind.startsWith("數量") && list.length > 1 ? [] : photoIds,
+        photos: x.kind.startsWith("數量") && list.length > 1 ? "" : pp.urls.join(" ") };
       r.issues = [toIssueRow(issue)].concat(r.issues || []);
       enqueue("saveIssue", issue.id, { issue });
     });
@@ -846,6 +984,8 @@ function issueGroups() {
     const g = (byVendor[v] = byVendor[v] || {});
     const it = (g[key] = g[key] || { session: i["單號"], code: String(i["產品編號"]), name: i["品名"], loc: i["地點"], items: [], notes: new Set(), time: "", who: new Set() });
     it.items.push(i); if (i["說明"]) it.notes.add(i["說明"]); it.who.add(i["回報人"]);
+    it.photos = it.photos || new Set();
+    String(i["照片"] || "").split(/\s+/).filter(Boolean).forEach(u => it.photos.add(u));
     if (String(i["回報時間"]) > it.time) it.time = String(i["回報時間"]);
   }
   return byVendor;
@@ -875,7 +1015,8 @@ function issuesHTML() {
         <span class="grow"><span class="name">${esc(it.name)}</span><br>
         <span class="small mono muted">${esc(it.code)} · ${esc(it.loc)} · ${esc(fmt(it.time))} · ${esc([...it.who].join("、"))}</span><br>
         ${it.items.map(i => `<span class="chip ${i["異常類型"].startsWith("數量") ? "warn" : "bad"}">${esc(kindText(i))}</span>`).join(" ")}
-        ${it.notes.size ? `<br><span class="small">說明：${esc([...it.notes].join("；"))}</span>` : ""}</span>
+        ${it.notes.size ? `<br><span class="small">說明：${esc([...it.notes].join("；"))}</span>` : ""}
+        ${it.photos.size ? `<br><span class="row" style="gap:6px;margin-top:6px">${[...it.photos].map((u, k) => { const m = u.match(/\/d\/([\w-]+)/); return `<a href="${esc(u)}" target="_blank" rel="noopener"><img src="${m ? `https://drive.google.com/thumbnail?id=${m[1]}&sz=w160` : ""}" alt="照片 ${k + 1}" style="width:56px;height:56px;object-fit:cover;border-radius:6px;border:1px solid var(--line);background:var(--sunk)"></a>`; }).join("")}</span>` : ""}</span>
         <select data-pst="${esc(it.session + "|" + it.code)}" style="width:auto">${ISSUE_STATUS.map(st => `<option ${st === productStatus(it) ? "selected" : ""}>${st}</option>`).join("")}</select></div>`).join("")}</div>
       <div class="row"><button class="primary grow" data-copy="${esc(v)}">複製給廠商的通知</button><button data-notified="${esc(v)}">標為已通知</button></div>
     </section>`;
@@ -905,6 +1046,7 @@ function bindIssues() {
     items.forEach((it, n) => {
       const p = byCode.get(it.code);
       lines.push(`${n + 1}. ${it.name}${p && p.bc ? `（條碼 ${p.bc}）` : ""}：${it.items.map(kindText).join("、")}${it.notes.size ? `。說明：${[...it.notes].join("；")}` : ""}`);
+      if (it.photos.size) lines.push(`   照片：${[...it.photos].join(" ")}`);
     });
     lines.push("", `驗收日期：${day(items.reduce((a, it) => it.time > a ? it.time : a, ""))}`, "再麻煩回覆處理方式（補寄、換貨或退回），謝謝。", "六福集團 商品開發處");
     navigator.clipboard.writeText(lines.join("\n")).then(() => toast("已複製，可以貼到 Email 或 LINE"), () => toast("這個瀏覽器不允許複製"));

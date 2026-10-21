@@ -26,7 +26,7 @@ var HEADERS = {
   scans: ['紀錄鍵', '單號', '區域', '人員', '裝置', '產品編號', '數量', '更新時間'],
   ledger: ['單號', '作業日期', '類型', '地點', '產品編號', '品名', '廠商', '數量', '人員', '寫入時間'],
   counts: ['單號', '盤點日期', '地點', '產品編號', '品名', '帳面數', '實盤數', '差異', '確認人', '確認時間'],
-  issues: ['編號', '回報時間', '單號', '地點', '廠商', '產品編號', '品名', '異常類型', '數量', '說明', '回報人', '處理狀態', '處理備註', '更新時間'],
+  issues: ['編號', '回報時間', '單號', '地點', '廠商', '產品編號', '品名', '異常類型', '數量', '說明', '回報人', '處理狀態', '處理備註', '更新時間', '照片'],
   sales: ['銷售日期', '地點', '產品編號或條碼', '數量', '備註'],
   stock: ['地點', '產品編號', '品名', '廠商', '帳面數']
 };
@@ -96,6 +96,7 @@ function doPost(e) {
         case 'saveSession': return saveSession_(body.session);
         case 'saveSheet': return saveSheet_(body);
         case 'saveIssue': return saveIssue_(body.issue);
+        case 'savePhoto': return savePhoto_(body);
         case 'finalize': return finalize_(body.id, body.person);
         case 'reopen': return reopen_(body.id);
         case 'deleteSession': return deleteSession_(body.id);
@@ -296,6 +297,7 @@ function sessionStatus_(id) {
 }
 
 function saveIssue_(x) {
+  ensureIssuePhotoHeader_();
   if (!x || !x.id) throw new Error('缺少異常編號');
   var sh = sheet_('issues'), data = rows_('issues'), idx = -1;
   for (var i = 0; i < data.length; i++) if (String(data[i][0]) === String(x.id)) { idx = i; break; }
@@ -303,10 +305,52 @@ function saveIssue_(x) {
   var row = [x.id, old['回報時間'] || x.reportedAt || nowIso_(), x.sessionId || old['單號'] || '', x.location || old['地點'] || '',
     x.vendor || old['廠商'] || '', x.code || old['產品編號'] || '', x.name || old['品名'] || '', x.kind || old['異常類型'] || '',
     x.qty != null ? x.qty : (old['數量'] || ''), x.note != null ? x.note : (old['說明'] || ''), x.person || old['回報人'] || '',
-    x.status || old['處理狀態'] || '待處理', x.resolution != null ? x.resolution : (old['處理備註'] || ''), nowIso_()];
+    x.status || old['處理狀態'] || '待處理', x.resolution != null ? x.resolution : (old['處理備註'] || ''), nowIso_(), x.photos != null ? x.photos : (old['照片'] || '')];
   if (idx >= 0) sh.getRange(idx + 2, 1, 1, row.length).setValues([row]);
   else { sh.appendRow(row); sh.getRange(sh.getLastRow(), 6).setNumberFormat('@').setValue(row[5]); }
   return {};
+}
+
+/* ============ 異常照片 ============ */
+
+// 舊版建立的「異常回報」分頁沒有「照片」欄，補上標題
+function ensureIssuePhotoHeader_() {
+  var sh = sheet_('issues'), col = HEADERS.issues.length;
+  if (sh.getRange(1, col).getValue() !== '照片') sh.getRange(1, col).setValue('照片').setFontWeight('bold');
+}
+
+function photoFolder_() {
+  var props = PropertiesService.getScriptProperties(), id = props.getProperty('PHOTO_FOLDER_ID');
+  if (id) { try { return DriveApp.getFolderById(id); } catch (e) {} }
+  var parent;
+  try { parent = DriveApp.getFileById(SpreadsheetApp.getActive().getId()).getParents().next(); } catch (e) { parent = DriveApp.getRootFolder(); }
+  var f = parent.createFolder('點收盤點_異常照片');
+  props.setProperty('PHOTO_FOLDER_ID', f.getId());
+  return f;
+}
+
+// 照片：手機先壓縮成 JPEG，以 base64 傳上來；同一個照片編號只存一次（重送不會重複）
+function savePhoto_(b) {
+  if (!b.photoId || !b.data) throw new Error('缺少照片');
+  var folder = photoFolder_(), name = b.photoId + '.jpg';
+  var it = folder.getFilesByName(name), file;
+  if (it.hasNext()) file = it.next();
+  else {
+    var bytes = Utilities.base64Decode(String(b.data).replace(/^data:image\/\w+;base64,/, ''));
+    file = folder.createFile(Utilities.newBlob(bytes, 'image/jpeg', name));
+    if (b.desc) file.setDescription(String(b.desc).slice(0, 500));
+    try { file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW); } catch (e) {}
+  }
+  return { fileId: file.getId(), url: 'https://drive.google.com/file/d/' + file.getId() + '/view' };
+}
+
+// 第一次使用照片功能前，在編輯器執行一次，授權存取 Drive
+function authorizePhotos() {
+  ensureIssuePhotoHeader_();
+  var f = photoFolder_();
+  var msg = '照片資料夾：' + f.getUrl();
+  Logger.log(msg);
+  try { SpreadsheetApp.getUi().alert(msg); } catch (e) {}
 }
 
 /* ============ 入帳（確認完成） ============ */
