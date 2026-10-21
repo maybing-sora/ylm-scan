@@ -73,6 +73,7 @@ function setup() {
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('點收盤點')
     .addItem('重新計算庫存彙總', 'refreshStockSheet')
+    .addItem('重新整理異常彙總', 'rebuildIssueSummary')
     .addItem('初始設定（只需一次）', 'setup')
     .addToUi();
 }
@@ -409,15 +410,26 @@ function savePhoto_(b) {
   return { fileId: file.getId(), url: 'https://drive.google.com/file/d/' + file.getId() + '/view' };
 }
 
-// 新功能上線後，在編輯器執行一次：授權 Drive 與 Google 文件，建立照片與驗收單資料夾
+// 新功能上線後，在編輯器執行一次：授權 Drive 與 Google 文件，補上新分頁與資料夾
+// 每一步都會寫進執行紀錄（左側「執行項目」→ 點進去可以看到停在哪一步）
 function authorizePhotos() {
-  ensureIssuePhotoHeader_();
-  ensureHeader_('counts'); sheet_('receipts'); sheet_('docs'); sheet_('log'); refreshIssueSummary_();
-  var f = photoFolder_(), d = docsFolder_();
-  var tmp = DocumentApp.create('授權測試（可刪除）'); DriveApp.getFileById(tmp.getId()).setTrashed(true);
-  var msg = '照片資料夾：' + f.getUrl() + '；驗收單資料夾：' + d.getUrl();
-  Logger.log(msg);
+  var step = function (name, fn) { var t0 = Date.now(); console.log('開始：' + name); var r = fn(); console.log('完成：' + name + '（' + (Date.now() - t0) + 'ms）'); return r; };
+  step('異常回報照片欄', ensureIssuePhotoHeader_);
+  step('盤點紀錄欄位', function () { ensureHeader_('counts'); });
+  step('新分頁', function () { ['receipts', 'docs', 'log', 'issueSum'].forEach(function (k) { sheet_(k); }); });
+  var f = step('照片資料夾', photoFolder_);
+  var d = step('驗收單資料夾', docsFolder_);
+  step('Google 文件授權', function () { var tmp = DocumentApp.create('授權測試（可刪除）'); DriveApp.getFileById(tmp.getId()).setTrashed(true); });
+  var msg = '設定完成。照片資料夾：' + f.getUrl() + '；驗收單資料夾：' + d.getUrl() + '。接著執行 rebuildIssueSummary 整理異常彙總。';
+  console.log(msg);
   try { SpreadsheetApp.getUi().alert(msg); } catch (e) {}
+}
+
+// 重新整理「異常彙總」分頁（平常每次回報異常都會自動更新，這個只在需要時手動執行）
+function rebuildIssueSummary() {
+  var t0 = Date.now();
+  refreshIssueSummary_();
+  console.log('異常彙總已更新（' + (Date.now() - t0) + 'ms）');
 }
 
 /* ============ 入帳（確認完成） ============ */
