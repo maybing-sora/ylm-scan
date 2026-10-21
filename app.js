@@ -24,6 +24,7 @@ const ZONES = ["整區", "A 牆", "B 牆", "中島", "櫃檯", "後場收納", "
 const ISSUE_KINDS = ["數量短少", "數量超收", "外箱或商品破損", "送錯款式或顏色", "缺條碼或吊牌（已補標）", "缺中文標示", "其他"];
 const OTHER_KINDS = ISSUE_KINDS.slice(2); // 數量以外的問題
 const ISSUE_STATUS = ["待處理", "已通知廠商", "已解決"];
+const WITHDRAWN = "已撤回"; // 同一品項重新填寫後，舊的回報自動撤回
 
 let device = LS.get("device", null);
 if (!device) { device = "d" + Math.random().toString(36).slice(2, 8); LS.set("device", device); }
@@ -394,7 +395,7 @@ function remainingFor(s, code, got) {
 const editing = new Set(); // 應收清單裡正在填實收數的品項
 function issuesFor(code) {
   const r = remote[view.id]; if (!r || !r.issues) return [];
-  return [...new Set(r.issues.filter(i => String(i["產品編號"]) === code).map(i => i["異常類型"]))];
+  return [...new Set(r.issues.filter(i => String(i["產品編號"]) === code && i["處理狀態"] !== WITHDRAWN).map(i => i["異常類型"]))];
 }
 const shortKind = k => ({ "外箱或商品破損": "破損", "送錯款式或顏色": "送錯款", "缺條碼或吊牌（已補標）": "已補標", "缺中文標示": "缺中文標示" }[k] || k);
 function expectHTML(s) {
@@ -489,6 +490,13 @@ function bindExpect() {
     if (qty !== need) list.push({ kind: qty < need ? "數量短少" : "數量超收", qty: Math.abs(need - qty) });
     OTHER_KINDS.forEach((k, i) => { if (document.getElementById(`k${i}-${code}`).checked) list.push({ kind: k, qty: kq }); });
     const r = remote[view.id] = remote[view.id] || { sheets: {}, issues: [] };
+    // 這個品項之前的回報（還沒處理的）全部撤回，以這次填的為準，避免重複
+    (r.issues || []).forEach(i => {
+      if (String(i["產品編號"]) === code && i["處理狀態"] === "待處理") {
+        i["處理狀態"] = WITHDRAWN;
+        enqueue("saveIssue", i["編號"], { issue: { id: i["編號"], status: WITHDRAWN } });
+      }
+    });
     list.forEach((x, n) => {
       const issue = { id: "I" + Date.now().toString(36) + n + Math.random().toString(36).slice(2, 5), sessionId: view.id, location: s.location, vendor: p ? p.v : s.vendor,
         code, name: p ? p.n : code, kind: x.kind, qty: x.qty, note, person, reportedAt: nowIso(), status: "待處理" };
@@ -817,40 +825,88 @@ async function loadIssues() {
   try { const j = await apiGet({ a: "issues" }); ISSUES = j.issues || []; LS.set("issues", ISSUES); online = true; } catch (e) { if (e instanceof TypeError) online = false; }
   if (view.name === "issues") render();
 }
+// 同一張單、同一品項、同一類型只留最新一筆；已撤回的不顯示
+function currentIssues() {
+  const latest = new Map();
+  for (const i of ISSUES) {
+    if (i["處理狀態"] === WITHDRAWN) continue;
+    const k = `${i["單號"]}|${i["產品編號"]}|${i["異常類型"]}`;
+    const old = latest.get(k);
+    if (!old || String(i["回報時間"]) > String(old["回報時間"])) latest.set(k, i);
+  }
+  return [...latest.values()];
+}
+function matchFilter(st) { return issueFilter === "all" || (issueFilter === "open" ? st !== "已解決" : st === issueFilter); }
+// 依廠商 → 品項整理：一個品項一列，列出所有問題
+function issueGroups() {
+  const byVendor = {};
+  for (const i of currentIssues()) {
+    if (!matchFilter(i["處理狀態"])) continue;
+    const v = i["廠商"] || "未指定廠商", key = `${i["單號"]}|${i["產品編號"]}`;
+    const g = (byVendor[v] = byVendor[v] || {});
+    const it = (g[key] = g[key] || { session: i["單號"], code: String(i["產品編號"]), name: i["品名"], loc: i["地點"], items: [], notes: new Set(), time: "", who: new Set() });
+    it.items.push(i); if (i["說明"]) it.notes.add(i["說明"]); it.who.add(i["回報人"]);
+    if (String(i["回報時間"]) > it.time) it.time = String(i["回報時間"]);
+  }
+  return byVendor;
+}
+const kindText = i => {
+  const k = i["異常類型"], q = i["數量"];
+  if (k === "數量短少") return `少 ${q} 件`;
+  if (k === "數量超收") return `多 ${q} 件`;
+  return `${shortKind(k)} ${q} 件`;
+};
+function productStatus(it) {
+  const st = [...new Set(it.items.map(i => i["處理狀態"]))];
+  return st.length === 1 ? st[0] : "待處理";
+}
 function issuesHTML() {
-  const list = ISSUES.filter(i => issueFilter === "all" || (issueFilter === "open" ? i["處理狀態"] !== "已解決" : i["處理狀態"] === issueFilter));
-  const groups = {};
-  list.forEach(i => { (groups[i["廠商"] || "未指定廠商"] = groups[i["廠商"] || "未指定廠商"] || []).push(i); });
+  const groups = issueGroups();
   return `
   <section class="row"><button class="ghost sm" id="home">返回</button><span class="grow"></span><button class="sm" id="reloadIssues">重新整理</button></section>
   <div class="filters" role="group" aria-label="狀態">
     ${[["open", "未解決"], ["待處理", "待處理"], ["已通知廠商", "已通知廠商"], ["已解決", "已解決"], ["all", "全部"]].map(([k, l]) => `<button aria-pressed="${issueFilter === k}" data-if="${k}">${l}</button>`).join("")}
   </div>
-  ${Object.keys(groups).length ? Object.entries(groups).map(([v, arr]) => `
-    <section class="panel">
-      <div class="row"><h2 class="grow">${esc(v)}</h2><button class="sm" data-copy="${esc(v)}">複製通知文字</button></div>
-      <div class="list">${arr.map(i => `<div class="item">
-        <span class="grow"><span class="name">${esc(i["品名"])}</span><br>
-        <span class="small muted">${esc(i["異常類型"])} · ${esc(i["數量"])} 件 · ${esc(i["地點"])} · ${esc(fmt(i["回報時間"]))} · ${esc(i["回報人"])}</span>
-        ${i["說明"] ? `<br><span class="small">${esc(i["說明"])}</span>` : ""}</span>
-        <select data-st="${esc(i["編號"])}" style="width:auto">${ISSUE_STATUS.map(s => `<option ${s === i["處理狀態"] ? "selected" : ""}>${s}</option>`).join("")}</select></div>`).join("")}</div>
-    </section>`).join("") : `<div class="note">目前沒有${issueFilter === "all" ? "" : "符合條件的"}異常回報。</div>`}`;
+  ${Object.keys(groups).length ? Object.entries(groups).map(([v, g]) => {
+    const items = Object.values(g);
+    return `<section class="panel">
+      <div class="row"><h2 class="grow">${esc(v)}</h2><span class="small muted">${items.length} 個品項</span></div>
+      <div class="list">${items.map(it => `<div class="item">
+        <span class="grow"><span class="name">${esc(it.name)}</span><br>
+        <span class="small mono muted">${esc(it.code)} · ${esc(it.loc)} · ${esc(fmt(it.time))} · ${esc([...it.who].join("、"))}</span><br>
+        ${it.items.map(i => `<span class="chip ${i["異常類型"].startsWith("數量") ? "warn" : "bad"}">${esc(kindText(i))}</span>`).join(" ")}
+        ${it.notes.size ? `<br><span class="small">說明：${esc([...it.notes].join("；"))}</span>` : ""}</span>
+        <select data-pst="${esc(it.session + "|" + it.code)}" style="width:auto">${ISSUE_STATUS.map(st => `<option ${st === productStatus(it) ? "selected" : ""}>${st}</option>`).join("")}</select></div>`).join("")}</div>
+      <div class="row"><button class="primary grow" data-copy="${esc(v)}">複製給廠商的通知</button><button data-notified="${esc(v)}">標為已通知</button></div>
+    </section>`;
+  }).join("") : `<div class="note">目前沒有${issueFilter === "all" ? "" : "符合條件的"}異常回報。</div>`}`;
+}
+function setStatus(list, st) {
+  list.forEach(i => { i["處理狀態"] = st; enqueue("saveIssue", i["編號"], { issue: { id: i["編號"], status: st } }); });
+  LS.set("issues", ISSUES);
 }
 function bindIssues() {
   document.getElementById("home").onclick = () => go({ name: "home" });
   document.getElementById("reloadIssues").onclick = loadIssues;
   document.querySelectorAll("[data-if]").forEach(b => b.onclick = () => { issueFilter = b.dataset.if; render(); });
-  document.querySelectorAll("[data-st]").forEach(sel => sel.onchange = () => {
-    const i = ISSUES.find(x => x["編號"] === sel.dataset.st); if (i) i["處理狀態"] = sel.value; LS.set("issues", ISSUES);
-    enqueue("saveIssue", sel.dataset.st, { issue: { id: sel.dataset.st, status: sel.value } });
-    toast("已更新狀態");
+  document.querySelectorAll("[data-pst]").forEach(sel => sel.onchange = () => {
+    const [sid, code] = sel.dataset.pst.split("|");
+    setStatus(currentIssues().filter(i => i["單號"] === sid && String(i["產品編號"]) === code), sel.value);
+    toast("已更新狀態"); render();
+  });
+  document.querySelectorAll("[data-notified]").forEach(b => b.onclick = () => {
+    const v = b.dataset.notified;
+    setStatus(currentIssues().filter(i => (i["廠商"] || "未指定廠商") === v && i["處理狀態"] === "待處理"), "已通知廠商");
+    toast("已標為已通知廠商"); render();
   });
   document.querySelectorAll("[data-copy]").forEach(b => b.onclick = () => {
-    const v = b.dataset.copy;
-    const arr = ISSUES.filter(i => (i["廠商"] || "未指定廠商") === v && i["處理狀態"] !== "已解決");
-    const lines = [`${v} 您好：`, "", "六福棲蘭明池點收時發現以下狀況，麻煩協助確認與處理："];
-    arr.forEach((i, n) => lines.push(`${n + 1}. ${day(i["回報時間"])} ${i["品名"]}（${i["產品編號"]}）：${i["異常類型"]} ${i["數量"]} 件${i["說明"] ? "，" + i["說明"] : ""}`));
-    lines.push("", "再麻煩回覆處理方式，謝謝。", "六福集團 商品開發處");
+    const v = b.dataset.copy, items = Object.values(issueGroups()[v] || {});
+    const lines = [`${v} 您好：`, "", "六福棲蘭明池驗收時發現以下狀況，麻煩協助確認與處理："];
+    items.forEach((it, n) => {
+      const p = byCode.get(it.code);
+      lines.push(`${n + 1}. ${it.name}${p && p.bc ? `（條碼 ${p.bc}）` : ""}：${it.items.map(kindText).join("、")}${it.notes.size ? `。說明：${[...it.notes].join("；")}` : ""}`);
+    });
+    lines.push("", `驗收日期：${day(items.reduce((a, it) => it.time > a ? it.time : a, ""))}`, "再麻煩回覆處理方式（補寄、換貨或退回），謝謝。", "六福集團 商品開發處");
     navigator.clipboard.writeText(lines.join("\n")).then(() => toast("已複製，可以貼到 Email 或 LINE"), () => toast("這個瀏覽器不允許複製"));
   });
 }
