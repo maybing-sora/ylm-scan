@@ -821,6 +821,8 @@ function bindSession(s) {
   const flt = document.getElementById("flt");
   if (flt) {
     flt.oninput = () => { expectFilter = flt.value; const e = document.getElementById("expect"); if (e) { e.innerHTML = expectHTML(s); bindExpect(); bindPhotoBoxes(e); } };
+    // 掃描槍刷完會送出 Enter：選取文字，下一次刷碼直接取代，不會黏在一起
+    flt.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); flt.select(); } };
     refreshScanParts();
     return;
   }
