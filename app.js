@@ -1062,7 +1062,7 @@ function issuesHTML() {
         ${it.items.map(i => `<span class="chip ${i["異常類型"].startsWith("數量") ? "warn" : "bad"}">${esc(kindText(i))}</span>`).join(" ")}
         ${it.notes.size ? `<br><span class="small">說明：${esc([...it.notes].join("；"))}</span>` : ""}
         ${it.photos.size ? `<br><span class="row" style="gap:6px;margin-top:6px">${[...it.photos].map((u, k) => { const m = u.match(/\/d\/([\w-]+)/); return `<a href="${esc(u)}" target="_blank" rel="noopener"><img src="${m ? `https://drive.google.com/thumbnail?id=${m[1]}&sz=w160` : ""}" alt="照片 ${k + 1}" style="width:56px;height:56px;object-fit:cover;border-radius:6px;border:1px solid var(--line);background:var(--sunk)"></a>`; }).join("")}</span>` : ""}</span>
-        <select data-pst="${esc(it.session + "|" + it.code)}" style="width:auto">${ISSUE_STATUS.map(st => `<option ${st === productStatus(it) ? "selected" : ""}>${st}</option>`).join("")}</select></div>`).join("")}</div>
+        <select data-pst="${esc(it.session + "|" + it.code)}" style="width:auto">${ISSUE_STATUS.map(st => `<option ${st === productStatus(it) ? "selected" : ""}>${st}</option>`).join("")}<option value="已撤回">誤報，撤回</option></select></div>`).join("")}</div>
       <div class="row"><button class="primary grow" data-copy="${esc(v)}">複製給廠商的通知</button><button data-notified="${esc(v)}">標為已通知</button></div>
     </section>`;
   }).join("") : `<div class="note">目前沒有${issueFilter === "all" ? "" : "符合條件的"}異常回報。</div>`}`;
@@ -1079,7 +1079,7 @@ function bindIssues() {
     if (!takeWho("whoIssue")) { render(); return; }
     const [sid, code] = sel.dataset.pst.split("|");
     setStatus(currentIssues().filter(i => i["單號"] === sid && String(i["產品編號"]) === code), sel.value);
-    toast("已更新狀態"); render();
+    toast(sel.value === WITHDRAWN ? "已撤回，這個品項的回報不會再出現在清單、彙總和之後產生的驗收單" : "已更新狀態"); render();
   });
   document.querySelectorAll("[data-notified]").forEach(b => b.onclick = () => {
     if (!takeWho("whoIssue")) return;

@@ -596,7 +596,8 @@ function sessionIssues_(id) {
     var x = latest[k], c = String(x['產品編號']);
     by[c] = by[c] || { text: [], photos: [], notes: [] };
     var kind = x['異常類型'], q = x['數量'];
-    by[c].text.push(kind === '數量短少' ? '少 ' + q + ' 件' : kind === '數量超收' ? '多 ' + q + ' 件' : kind === '未到貨' ? '未到貨 ' + q + ' 件' : kind + ' ' + q + ' 件');
+    by[c].text.push((kind === '數量短少' ? '少 ' + q + ' 件' : kind === '數量超收' ? '多 ' + q + ' 件' : kind === '未到貨' ? '未到貨 ' + q + ' 件' : kind + ' ' + q + ' 件')
+      + (x['處理狀態'] === '已解決' ? '（已解決）' : ''));
     if (x['說明'] && by[c].notes.indexOf(x['說明']) < 0) by[c].notes.push(x['說明']);
     String(x['照片'] || '').split(/\s+/).forEach(function (u) { if (u && by[c].photos.indexOf(u) < 0) by[c].photos.push(u); });
   });
