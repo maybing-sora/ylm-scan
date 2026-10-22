@@ -955,6 +955,7 @@ function resultInner(s) {
   <section class="row"><button class="grow" id="copy">複製表格</button></section>
   ${locked(s) ? `<section class="panel"><p style="margin:0">已在 ${esc(fmt(s.confirmedAt))} 由 ${esc(s.confirmedBy || "")} 確認入帳。</p>
       ${remote[view.id] && remote[view.id].doc ? `<a class="primary" href="${esc(remote[view.id].doc.url)}" target="_blank" rel="noopener" style="display:block;text-align:center;padding:12px;border-radius:8px;background:var(--accent);color:var(--accent-fg);text-decoration:none;font-weight:700">開啟驗收單 PDF</a><p class="small muted" style="margin:0">PDF 存在 Drive「點收盤點_驗收單」資料夾，可以直接轉給財務。</p>` : ""}
+      ${s.type === "receive" && !confirmAsk ? `<div class="panel" style="gap:8px">${whoFieldHTML("whoDoc")}<button id="refreshDoc">更新驗收單</button><span class="small muted">在異常清單改過狀態（已解決、誤報撤回）後按這裡，會依最新狀態重新產生 PDF，不影響庫存，也不用重新開啟。</span></div>` : ""}
       ${confirmAsk ? `<div class="confirm"><b>確定要重新開啟？</b><span class="small">這張單寫入的庫存異動會被撤回，可以繼續修改後再確認一次。</span>${whoFieldHTML("whoAct")}<div class="row"><button id="no">取消</button><button class="danger grow" id="yesReopen">重新開啟</button></div></div>` : `<button class="danger" id="reopen">重新開啟</button>`}</section>`
     : `<section class="panel">
       ${pending ? `<div class="note warn">還有 ${pending} 筆掃描沒有上傳，連上網路後再確認入帳。</div>` : ""}
@@ -990,6 +991,14 @@ function bindResult(s) {
       toast(j.already ? "這張單之前已經入帳" : j.docError ? `已入帳，但${j.docError}` : `已入帳，寫入 ${j.written} 筆異動${j.autoIssues ? `，自動標示 ${j.autoIssues} 項數量異常` : ""}${j.doc ? "，驗收單 PDF 已產生" : ""}`);
       confirmAsk = false; await loadRemote(s.id); await refreshReceived(); render();
     } catch (e) { toast("入帳失敗：" + (e instanceof TypeError ? "沒有網路" : e.message)); yes.disabled = false; yes.textContent = "確認入帳"; }
+  };
+  const rd = document.getElementById("refreshDoc"); if (rd) rd.onclick = async () => {
+    if (!takeWho("whoDoc")) return;
+    rd.disabled = true; rd.textContent = "產生中…";
+    try {
+      const j = await apiPost({ a: "refreshReceipt", id: s.id });
+      toast("驗收單已更新"); await loadRemote(s.id); render(true);
+    } catch (e) { toast("更新失敗：" + (e instanceof TypeError ? "沒有網路" : e.message)); rd.disabled = false; rd.textContent = "更新驗收單"; }
   };
   const dl = document.getElementById("del"); if (dl) dl.onclick = () => { deleteAsk = true; render(true); };
   const nd = document.getElementById("noDel"); if (nd) nd.onclick = () => { deleteAsk = false; render(true); };

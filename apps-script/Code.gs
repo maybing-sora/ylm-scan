@@ -113,6 +113,7 @@ function doPost(e) {
         case 'finalize': return finalize_(body.id, who);
         case 'reopen': return reopen_(body.id);
         case 'deleteSession': return deleteSession_(body.id);
+        case 'refreshReceipt': return refreshReceipt_(body.id);
         default: throw new Error('未知的動作');
       }
     } finally { lock.releaseLock(); }
@@ -240,9 +241,10 @@ function boot_() {
 }
 
 // 已確認驗收的累計實收（依產品編號），用來算「還沒到的數量」
-function receivedTotals_() {
+function receivedTotals_(excludeId) {
   var m = {};
   rows_('ledger').forEach(function (r) {
+    if (excludeId && String(r[0]) === String(excludeId)) return;
     if (r[2] === '驗收') m[String(r[4])] = (m[String(r[4])] || 0) + Number(r[7] || 0);
   });
   return m;
@@ -605,7 +607,7 @@ function sessionIssues_(id) {
 }
 
 function receiptRows_(id, s, totals, P, person, t) {
-  var before = receivedTotals_(), issues = sessionIssues_(id), vendor = s['廠商'];
+  var before = receivedTotals_(id), issues = sessionIssues_(id), vendor = s['廠商'];
   var who = {};
   rows_('scans').forEach(function (r) { if (String(r[1]) === String(id) && r[3]) who[r[3]] = 1; });
   var receivers = Object.keys(who).join('、') || s['建立人'] || person || '';
@@ -651,7 +653,33 @@ function docFor_(id) {
 var money_ = function (n) { return '$' + Math.round(Number(n) || 0).toLocaleString('en-US'); };
 
 // 用 Google 文件排版，再轉成 PDF 存到「點收盤點_驗收單」資料夾
-function makeReceiptPdf_(id, s, receipt, person, t) {
+// 已入帳的驗收單：依最新的異常狀態重新產生驗收對帳與 PDF，不動庫存
+function refreshReceipt_(id) {
+  var s = null;
+  rows_('sessions').forEach(function (r) { if (String(r[0]) === String(id)) s = obj_('sessions', r); });
+  if (!s) throw new Error('找不到這張單');
+  if (s['類型'] !== '驗收') throw new Error('只有驗收單有驗收單 PDF');
+  if (s['狀態'] !== '已確認') throw new Error('這張單還沒確認入帳');
+  var totals = {};
+  rows_('scans').forEach(function (r) {
+    if (String(r[1]) !== String(id) || String(r[5]).charAt(0) === '?') return;
+    totals[String(r[5])] = (totals[String(r[5])] || 0) + Number(r[6] || 0);
+  });
+  var P = {};
+  loadProducts_().forEach(function (p) { P[p.c] = p; });
+  var person = s['確認人'] || '', t = s['確認時間'] || nowIso_();
+  var receipt = receiptRows_(id, s, totals, P, person, t);
+  replaceRows_('receipts', function (r) { return String(r[0]) !== String(id); }, receipt.rows, 5);
+  rows_('docs').forEach(function (r) {
+    if (String(r[0]) === String(id)) { try { DriveApp.getFileById(String(r[4])).setTrashed(true); } catch (e) {} }
+  });
+  replaceRows_('docs', function (r) { return String(r[0]) !== String(id); }, [], 0);
+  var doc = makeReceiptPdf_(id, s, receipt, person, t, { by: CURRENT_.who, at: nowIso_() });
+  log_('更新驗收單', id, '依最新異常狀態重新產生 PDF');
+  return { doc: doc };
+}
+
+function makeReceiptPdf_(id, s, receipt, person, t, updated) {
   var vendor = s['廠商'], sum = receipt.sum, recDate = day_(s['作業日期']);
   var name = '驗收單_' + recDate.replace(/-/g, '') + '_' + vendor + '_' + id;
   var doc = DocumentApp.create(name), body = doc.getBody();
@@ -690,7 +718,9 @@ function makeReceiptPdf_(id, s, receipt, person, t) {
       });
     });
   }
-  body.appendParagraph('本單由點收盤點工具於確認入帳時產生，驗收人與確認入帳人即為確認紀錄，不另簽名。').setFontSize(8).setForegroundColor('#666666').setSpacingBefore(12);
+  body.appendParagraph('本單由點收盤點工具於確認入帳時產生，驗收人與確認入帳人即為確認紀錄，不另簽名。'
+    + (updated ? '異常狀態最後更新：' + String(updated.at).replace('T', ' ').slice(0, 16) + '（' + (updated.by || '') + '）。' : ''))
+    .setFontSize(8).setForegroundColor('#666666').setSpacingBefore(12);
   doc.saveAndClose();
   var docFile = DriveApp.getFileById(doc.getId());
   var pdf = docsFolder_().createFile(docFile.getAs('application/pdf').setName(name + '.pdf'));
