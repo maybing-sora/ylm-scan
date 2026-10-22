@@ -515,7 +515,8 @@ function remainingFor(s, code, got) {
 const editing = new Set(); // 應收清單裡正在填實收數的品項
 function issuesFor(code) {
   const r = remote[view.id]; if (!r || !r.issues) return [];
-  return [...new Set(r.issues.filter(i => String(i["產品編號"]) === code && i["處理狀態"] !== WITHDRAWN).map(i => i["異常類型"]))];
+  // 只標示還沒結案的問題；已解決、已撤回的不再掛在品項上
+  return [...new Set(r.issues.filter(i => String(i["產品編號"]) === code && OPEN_ST.includes(i["處理狀態"])).map(i => i["異常類型"]))];
 }
 const OPEN_ST = ["待處理", "已通知廠商"]; // 還沒結案的回報
 // 撤回這個品項目前還沒結案的回報（改成「相符」或重新填寫時用）
