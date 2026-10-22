@@ -517,9 +517,22 @@ function issuesFor(code) {
   const r = remote[view.id]; if (!r || !r.issues) return [];
   return [...new Set(r.issues.filter(i => String(i["產品編號"]) === code && i["處理狀態"] !== WITHDRAWN).map(i => i["異常類型"]))];
 }
+const OPEN_ST = ["待處理", "已通知廠商"]; // 還沒結案的回報
+// 撤回這個品項目前還沒結案的回報（改成「相符」或重新填寫時用）
+function withdrawOpen(code) {
+  const r = remote[view.id]; let n = 0;
+  ((r && r.issues) || []).forEach(i => {
+    if (String(i["產品編號"]) === code && OPEN_ST.includes(i["處理狀態"])) {
+      i["處理狀態"] = WITHDRAWN; n++;
+      enqueue("saveIssue", i["編號"], { issue: { id: i["編號"], status: WITHDRAWN } });
+    }
+  });
+  if (n) LS.set("remote", remote);
+  return n;
+}
 function openIssuesFor(code) {
   const r = remote[view.id]; if (!r || !r.issues) return [];
-  return r.issues.filter(i => String(i["產品編號"]) === code && i["處理狀態"] === "待處理");
+  return r.issues.filter(i => String(i["產品編號"]) === code && OPEN_ST.includes(i["處理狀態"]));
 }
 // 之前回報的照片（已上傳的網址 + 還在手機等上傳的照片編號），重新填寫時沿用
 function prevPhotos(code) {
@@ -568,9 +581,10 @@ function expectHTML(s) {
         <div class="row"><button class="sm" data-cancel="${p.c}">取消</button><button class="sm primary grow" data-save="${p.c}" data-need="${need}" data-got="${g}">儲存</button></div>
       </div>`;
     }
-    const actions = g === need
+    const hasOpen = openIssuesFor(p.c).length > 0;
+    const actions = g === need && !hasOpen
       ? `<button class="sm ghost" data-edit="${p.c}">有問題</button>`
-      : `<button class="sm" data-match="${p.c}" data-need="${need - g}">相符 ✓</button><button class="sm" data-edit="${p.c}">有問題</button>`;
+      : `<button class="sm" data-match="${p.c}" data-need="${need - g}">${hasOpen ? "改為相符" : "相符 ✓"}</button><button class="sm" data-edit="${p.c}">有問題</button>`;
     return `<div class="item">${head}<span class="mono small">${g}/${need}</span><span class="chip ${st[0]}">${st[1]}</span>${tags}${actions}</div>`;
   });
   const sum = document.getElementById("recvSum"); if (sum) sum.textContent = `${gotSum} / ${needSum}`;
@@ -621,7 +635,12 @@ function bindExpect() {
   const myCount = code => { const sh = sheets[sheetKey(view.id, view.zone)]; return (sh && sh.counts[code]) || 0; };
   document.querySelectorAll("[data-match]").forEach(b => b.onclick = () => {
     const code = b.dataset.match, need = +b.dataset.need;
-    if (bump(code, 0, myCount(code) + need)) { const p = byCode.get(code); lastHit = null; toast(`已標記相符：${p ? p.n : code}`); }
+    const mine = myCount(code), target = mine + need;
+    if (target < 0) { toast("其他人記的數量比應收還多，請到「有問題」調整"); return; }
+    if (bump(code, 0, target)) {
+      const p = byCode.get(code), n = withdrawOpen(code); lastHit = null;
+      toast(`已標記相符：${p ? p.n : code}${n ? `，撤回 ${n} 筆回報` : ""}`);
+    }
     refreshScanParts();
   });
   document.querySelectorAll("[data-edit]").forEach(b => b.onclick = () => { editing.add(b.dataset.edit); refreshScanParts(); const i = document.getElementById("ed-" + b.dataset.edit); if (i) i.focus(); });
@@ -646,12 +665,7 @@ function bindExpect() {
     OTHER_KINDS.forEach((k, i) => { if (document.getElementById(`k${i}-${code}`).checked) list.push({ kind: k, qty: kq }); });
     const r = remote[view.id] = remote[view.id] || { sheets: {}, issues: [] };
     // 這個品項之前的回報（還沒處理的）全部撤回，以這次填的為準，避免重複
-    (r.issues || []).forEach(i => {
-      if (String(i["產品編號"]) === code && i["處理狀態"] === "待處理") {
-        i["處理狀態"] = WITHDRAWN;
-        enqueue("saveIssue", i["編號"], { issue: { id: i["編號"], status: WITHDRAWN } });
-      }
-    });
+    withdrawOpen(code);
     list.forEach((x, n) => {
       const issue = { id: "I" + Date.now().toString(36) + n + Math.random().toString(36).slice(2, 5), sessionId: view.id, location: s.location, vendor: p ? p.v : s.vendor,
         code, name: p ? p.n : code, kind: x.kind, qty: x.qty, note, person, reportedAt: nowIso(), status: "待處理",
@@ -973,7 +987,7 @@ function bindResult(s) {
       const j = await apiPost({ a: "finalize", id: s.id, person });
       s.status = "已確認"; s.confirmedBy = person; s.confirmedAt = nowIso(); delete s._local; saveLocal();
       toast(j.already ? "這張單之前已經入帳" : j.docError ? `已入帳，但${j.docError}` : `已入帳，寫入 ${j.written} 筆異動${j.autoIssues ? `，自動標示 ${j.autoIssues} 項數量異常` : ""}${j.doc ? "，驗收單 PDF 已產生" : ""}`);
-      confirmAsk = false; await loadRemote(s.id); refreshReceived(); render();
+      confirmAsk = false; await loadRemote(s.id); await refreshReceived(); render();
     } catch (e) { toast("入帳失敗：" + (e instanceof TypeError ? "沒有網路" : e.message)); yes.disabled = false; yes.textContent = "確認入帳"; }
   };
   const dl = document.getElementById("del"); if (dl) dl.onclick = () => { deleteAsk = true; render(true); };
@@ -992,7 +1006,8 @@ function bindResult(s) {
     yr.disabled = true;
     try {
       await apiPost({ a: "reopen", id: s.id });
-      s.status = "進行中"; saveLocal(); toast("已重新開啟"); confirmAsk = false; refreshReceived(); render();
+      s.status = "進行中"; saveLocal(); toast("已重新開啟"); confirmAsk = false;
+      await refreshReceived(); await loadRemote(s.id); render();
     } catch (e) { toast("無法重新開啟：" + (e instanceof TypeError ? "沒有網路" : e.message)); yr.disabled = false; }
   };
 }
