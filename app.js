@@ -418,7 +418,7 @@ function sessionHTML(s) {
       <span class="grow small muted">${s.vendor ? esc(s.vendor) + " · " : ""}作業日 ${esc(s.date)}${s.poDate ? " · 進貨單 " + esc(s.poDate) : ""}${s.memo ? " · " + esc(s.memo) : ""}<br>${esc(s.id)} · ${esc(s.createdBy || "")}</span>
       <button class="ghost sm" id="home">返回</button></div>
     <div class="tabs" role="tablist">
-      <button role="tab" id="tabScan" aria-selected="${view.tab === "scan"}">${s.type === "receive" ? "點收" : "清點"}</button>
+      <button role="tab" id="tabScan" aria-selected="${view.tab === "scan"}">${{ receive: "點收", return: "退貨品項" }[s.type] || "清點"}</button>
       <button role="tab" id="tabRes" aria-selected="${view.tab === "res"}">結果與入帳</button>
     </div>
   </section>
@@ -426,6 +426,19 @@ function sessionHTML(s) {
 }
 function scanHTML(s) {
   if (locked(s)) return `<div class="note">這張單已在 ${esc(fmt(s.confirmedAt))} 由 ${esc(s.confirmedBy || "")} 確認入帳。${s.type === "transfer" && !s.receivedAt ? `貨品在途中，「${esc(s.to)}」收到後請到「結果與入帳」按「確認收貨」。` : "要修改請到「結果與入帳」按「重新開啟」。"}</div>`;
+  if (s.type === "return") return `
+  <section class="panel">
+    <label>操作人（必填）<input id="who2" value="${esc(person)}" placeholder="你的名字"></label>
+    <input id="flt" value="${esc(expectFilter)}" placeholder="找品項：品名、產品編號或廠商條碼" autocomplete="off">
+    <span class="small muted">只會在 ${esc(s.vendor)} 的品項裡找。條碼打前幾碼或後幾碼都可以。找到後直接按「全退」或填退貨數量。</span>
+  </section>
+  <section class="panel">
+    <div class="row"><h3 class="grow">退貨清單（${esc(s.vendor)}）</h3><span class="small mono" id="retSum"></span></div>
+    <div class="row"><div class="filters"><button aria-pressed="${retFilter === "all"}" data-rf="all">全部</button><button aria-pressed="${retFilter === "picked"}" data-rf="picked">已填數量</button></div>
+      <span class="grow"></span><button class="sm" id="retAll">全部全退</button><button class="sm ghost" id="retClear">全部清除</button></div>
+    <span class="small muted">列出「${esc(s.location)}」帳面上有的品項和帳面數。填好後到「結果與入帳」確認，會產生退貨單 PDF。</span>
+    <div id="retlist" class="list"></div>
+  </section>`;
   return `
   <section class="panel">
     <div class="row">
@@ -450,10 +463,6 @@ function scanHTML(s) {
     <h3 id="mineTitle"></h3>
     <div id="mine" class="list"></div>
   </section>
-  ${s.type === "return" ? `<section class="panel"><div class="row"><h3 class="grow">退貨清單（${esc(s.vendor)}）</h3>
-    <div class="filters"><button aria-pressed="${retFilter === "all"}" data-rf="all">全部</button><button aria-pressed="${retFilter === "picked"}" data-rf="picked">已填數量</button></div></div>
-    <span class="small muted">列出「${esc(s.location)}」帳面上有的 ${esc(s.vendor)} 品項。直接在要退的品項填數量，或按 ＋／−。</span>
-    <div id="retlist" class="list"></div></section>` : ""}
   ${s.type === "count" ? `<section class="panel"><div class="row"><h3 class="grow">帳面清單（${esc(s.location)}）</h3>
     <div class="filters"><button aria-pressed="${bookFilter === "todo"}" data-bf="todo">未點</button><button aria-pressed="${bookFilter === "diff"}" data-bf="diff">有差異</button><button aria-pressed="${bookFilter === "all"}" data-bf="all">全部</button></div></div>
     <span class="small muted">帳面數是上次盤點加減之後的進出算出來的。每一項都要實際點過；點完數量和帳面不同，結案前要複盤或填原因。</span>
@@ -485,21 +494,38 @@ function bookLineHTML(code) {
   return `<div class="small">「${esc(s.location)}」帳面 <b class="mono">${b}</b>　這張單共 <b class="mono">${tot}</b>${tot > b ? `　<span class="chip warn">超過帳面 ${tot - b}，請再確認數量</span>` : ""}</div>`;
 }
 let bookFilter = "todo", retFilter = "all";
-function retListHTML(s) {
-  const book = bookOf(view.id);
-  if (!book) return `<p class="small muted" style="margin:0">${noBookMsg(view.id)}</p>`;
-  const t = totals(view.id), sh = sheets[sheetKey(view.id, view.zone)];
-  let rows = P.filter(p => p.v === s.vendor && ((book[p.c] || 0) > 0 || t.has(p.c)))
+function retRows(s) {
+  const book = bookOf(view.id) || {}, t = totals(view.id), sh = sheets[sheetKey(view.id, view.zone)];
+  return P.filter(p => p.v === s.vendor && ((book[p.c] || 0) > 0 || t.has(p.c)))
     .map(p => ({ p, b: book[p.c] || 0, tot: (t.get(p.c) || {}).qty || 0, mine: (sh && sh.counts[p.c]) || 0 }));
-  const picked = rows.filter(r => r.tot).length, sum = rows.reduce((a, r) => a + r.tot, 0);
+}
+// 把這張單某品項的退貨總數設成 target（其他人填的不動）
+function retSet(code, target) {
+  const sh = sheets[sheetKey(view.id, view.zone)], mine = (sh && sh.counts[code]) || 0;
+  const tot = (totals(view.id).get(code) || {}).qty || 0, others = tot - mine;
+  return bump(code, 0, Math.max(0, target - others));
+}
+function retShown(s) {
+  let rows = retRows(s);
+  if (expectFilter.trim()) { const m = new Set(suggest(expectFilter, rows.map(r => r.p), 999).map(r => r.p.c)); rows = rows.filter(r => m.has(r.p.c)); }
   if (retFilter === "picked") rows = rows.filter(r => r.tot);
-  rows.sort((a, b) => String(a.p.n).localeCompare(String(b.p.n), "zh-Hant"));
-  const avail = P.filter(p => p.v === s.vendor && (book[p.c] || 0) > 0).length;
-  return `<p class="small" style="margin:0">帳面上有 ${avail} 項，已填 <b>${picked}</b> 項、共 <b>${sum}</b> 件。</p>` +
-    (rows.map(r => `<div class="item"><span class="grow"><span class="name">${esc(r.p.n)}</span><br><span class="small mono muted">${esc(r.p.c)}</span><br>
-      <span class="small">帳面 <b class="mono">${r.b}</b>${r.tot !== r.mine ? `　全部共 ${r.tot}` : ""}${r.tot > r.b ? `　<span class="chip warn">超過帳面 ${r.tot - r.b}</span>` : ""}</span></span>
-      <div class="qty"><button data-rc2="${esc(r.p.c)}" data-d="-1" aria-label="減 1">−</button><input type="number" min="0" inputmode="numeric" value="${r.mine}" data-rq="${esc(r.p.c)}"><button data-rc2="${esc(r.p.c)}" data-d="1" aria-label="加 1">＋</button></div></div>`).join("")
-      || `<p class="small muted" style="margin:0">${retFilter === "picked" ? "還沒有填數量的品項。" : "這家廠商在這個地點沒有帳面庫存。"}</p>`);
+  return rows.sort((a, b) => String(a.p.n).localeCompare(String(b.p.n), "zh-Hant"));
+}
+function retListHTML(s) {
+  if (!bookOf(view.id)) return `<p class="small muted" style="margin:0">${noBookMsg(view.id)}</p>`;
+  const all = retRows(s), rows = retShown(s);
+  const sum = document.getElementById("retSum");
+  if (sum) sum.textContent = `已選 ${all.filter(r => r.tot).length} 項 · ${all.reduce((a, r) => a + r.tot, 0)} 件`;
+  const head = expectFilter.trim() ? `<div class="row small" style="padding:6px 0"><span class="grow muted">找到 ${rows.length} 項</span><button class="sm ghost" data-clearflt="1">顯示全部</button></div>` : "";
+  return head + (rows.map(r => {
+    const st = !r.tot ? "" : r.tot > r.b ? `<span class="chip warn">超過帳面 ${r.tot - r.b}</span>` : r.tot === r.b ? `<span class="chip ok">全退</span>` : `<span class="chip info">退 ${r.tot}</span>`;
+    return `<div class="item"><span class="grow" style="min-width:160px"><span class="name">${esc(r.p.n)}</span><br><span class="small mono muted">${esc(r.p.c)}${r.p.bc ? " · " + esc(r.p.bc) : ""}</span><br>
+      <span class="small">帳面 <b class="mono">${r.b}</b>　${st}</span></span>
+      <span style="display:flex;gap:8px;align-items:flex-end">
+        <button class="sm ${r.tot && r.tot === r.b ? "primary" : ""}" data-retfull="${esc(r.p.c)}" data-b="${r.b}" ${r.b > 0 ? "" : "disabled"}>全退</button>
+        <label style="min-width:0;flex:0 0 88px">退貨數<input type="number" min="0" inputmode="numeric" data-rq="${esc(r.p.c)}" value="${r.tot || ""}" placeholder="0"></label>
+      </span></div>`;
+  }).join("") || `<p class="small muted" style="margin:0">${retFilter === "picked" ? "還沒有填數量的品項。" : expectFilter.trim() ? "沒有符合的品項。" : "這家廠商在這個地點沒有帳面庫存。"}</p>`);
 }
 function bookListHTML(s) {
   const book = bookOf(view.id);
@@ -692,8 +718,11 @@ function refreshScanParts() {
   }
   const rl = document.getElementById("retlist"); if (rl) {
     rl.innerHTML = retListHTML(s);
-    rl.querySelectorAll("button[data-rc2]").forEach(b => b.onclick = () => { bump(b.dataset.rc2, +b.dataset.d); refreshScanParts(); });
-    rl.querySelectorAll("input[data-rq]").forEach(i => i.onchange = () => { bump(i.dataset.rq, 0, +i.value || 0); refreshScanParts(); });
+    rl.querySelectorAll("[data-retfull]").forEach(b => b.onclick = () => { retSet(b.dataset.retfull, +b.dataset.b); refreshScanParts(); });
+    rl.querySelectorAll("input[data-rq]").forEach(i => i.onchange = () => { retSet(i.dataset.rq, Math.max(0, Math.round(+i.value || 0))); refreshScanParts(); });
+    rl.querySelectorAll("[data-clearflt]").forEach(b => b.onclick = () => { expectFilter = ""; const f = document.getElementById("flt"); if (f) f.value = ""; refreshScanParts(); });
+    const ra = document.getElementById("retAll"); if (ra) ra.onclick = () => { const rows = retShown(s).filter(r => r.b > 0); if (!rows.length) return; let ok = true; rows.forEach(r => { if (ok) ok = retSet(r.p.c, r.b); }); if (ok) toast(`已設定 ${rows.length} 項全退`); refreshScanParts(); };
+    const rc = document.getElementById("retClear"); if (rc) rc.onclick = () => { const rows = retRows(s).filter(r => r.tot); let ok = true; rows.forEach(r => { if (ok) ok = retSet(r.p.c, 0); }); if (ok && rows.length) toast("已清除"); refreshScanParts(); };
   }
   document.querySelectorAll("[data-rf]").forEach(b => b.onclick = () => { retFilter = b.dataset.rf; document.querySelectorAll("[data-rf]").forEach(x => x.setAttribute("aria-pressed", x.dataset.rf === retFilter)); refreshScanParts(); });
   document.querySelectorAll("[data-bf]").forEach(b => b.onclick = () => { bookFilter = b.dataset.bf; document.querySelectorAll("[data-bf]").forEach(x => x.setAttribute("aria-pressed", x.dataset.bf === bookFilter)); refreshScanParts(); });
@@ -930,11 +959,11 @@ function bindSession(s) {
   if (view.tab === "res") { bindResult(s); return; }
   if (locked(s)) return;
   const z = document.getElementById("zone");
-  z.onchange = () => { view.zone = z.value.trim() || "整區"; LS.set("zone." + view.id, view.zone); lastHit = null; refreshScanParts(); };
+  if (z) z.onchange = () => { view.zone = z.value.trim() || "整區"; LS.set("zone." + view.id, view.zone); lastHit = null; refreshScanParts(); };
   const w = document.getElementById("who2"); w.onchange = () => { person = w.value.trim(); LS.set("person", person); };
   const flt = document.getElementById("flt");
   if (flt) {
-    flt.oninput = () => { expectFilter = flt.value; const e = document.getElementById("expect"); if (e) { e.innerHTML = expectHTML(s); bindExpect(); bindPhotoBoxes(e); } };
+    flt.oninput = () => { expectFilter = flt.value; if (s.type === "return") { refreshScanParts(); return; } const e = document.getElementById("expect"); if (e) { e.innerHTML = expectHTML(s); bindExpect(); bindPhotoBoxes(e); } };
     // 掃描槍刷完會送出 Enter：選取文字，下一次刷碼直接取代，不會黏在一起
     flt.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); flt.select(); } };
     refreshScanParts();
@@ -1031,7 +1060,7 @@ function resultInner(s) {
   const fin = {
     receive: "確認後，實收數量會記入「" + s.location + "」的庫存。",
     transfer: `確認後，會從「${s.location}」扣除，貨品變成「在途」；「${s.to}」收到後按「確認收貨」，才會加到「${s.to}」。`,
-    return: `確認後，會從「${s.location}」的庫存扣除。`,
+    return: `確認後，會從「${s.location}」的庫存扣除，並產生退貨單 PDF。`,
     count: `確認後，差異會記為盤差並產生盤差單 PDF，「${s.location}」的帳面數改成這次的盤點數。`
   }[s.type];
   return `
@@ -1073,7 +1102,7 @@ function resultInner(s) {
   </table></div>`}
   <section class="row"><button class="grow" id="copy">複製表格</button></section>
   ${locked(s) ? `<section class="panel"><p style="margin:0">已在 ${esc(fmt(s.confirmedAt))} 由 ${esc(s.confirmedBy || "")} 確認入帳。</p>
-      ${remote[view.id] && remote[view.id].doc ? `<a class="primary" href="${esc(remote[view.id].doc.url)}" target="_blank" rel="noopener" style="display:block;text-align:center;padding:12px;border-radius:8px;background:var(--accent);color:var(--accent-fg);text-decoration:none;font-weight:700">開啟${s.type === "count" ? "盤差單" : "驗收單"} PDF</a><p class="small muted" style="margin:0">PDF 存在 Drive「點收盤點_驗收單」資料夾，可以直接轉給財務。</p>` : ""}
+      ${remote[view.id] && remote[view.id].doc ? `<a class="primary" href="${esc(remote[view.id].doc.url)}" target="_blank" rel="noopener" style="display:block;text-align:center;padding:12px;border-radius:8px;background:var(--accent);color:var(--accent-fg);text-decoration:none;font-weight:700">開啟${{ count: "盤差單", return: "退貨單" }[s.type] || "驗收單"} PDF</a><p class="small muted" style="margin:0">PDF 存在 Drive「點收盤點_驗收單」資料夾，可以直接轉給財務。</p>` : ""}
       ${s.type === "receive" && !confirmAsk ? `<div class="panel" style="gap:8px">${whoFieldHTML("whoDoc")}<button id="refreshDoc">更新驗收單</button><span class="small muted">在異常清單改過狀態（已解決、誤報撤回）後按這裡，會依最新狀態重新產生 PDF，不影響庫存，也不用重新開啟。</span></div>` : ""}
       ${confirmAsk ? `<div class="confirm"><b>確定要重新開啟？</b><span class="small">這張單寫入的庫存異動會被撤回，可以繼續修改後再確認一次。</span>${whoFieldHTML("whoAct")}<div class="row"><button id="no">取消</button><button class="danger grow" id="yesReopen">重新開啟</button></div></div>` : `<button class="danger" id="reopen">重新開啟</button>`}</section>`
     : `<section class="panel">
@@ -1115,7 +1144,7 @@ function bindResult(s) {
       }
       const j = await apiPost({ a: "finalize", id: s.id, person, reasons: rs });
       s.status = "已確認"; s.confirmedBy = person; s.confirmedAt = nowIso(); delete s._local; saveLocal();
-      toast(j.already ? "這張單之前已經入帳" : j.docError ? `已入帳，但${j.docError}` : `已入帳，寫入 ${j.written} 筆異動${j.autoIssues ? `，自動標示 ${j.autoIssues} 項數量異常` : ""}${j.doc ? `，${s.type === "count" ? "盤差單" : "驗收單"} PDF 已產生` : ""}${s.type === "transfer" ? "，貨品在途，等目的地確認收貨" : ""}`);
+      toast(j.already ? "這張單之前已經入帳" : j.docError ? `已入帳，但${j.docError}` : `已入帳，寫入 ${j.written} 筆異動${j.autoIssues ? `，自動標示 ${j.autoIssues} 項數量異常` : ""}${j.doc ? `，${{ count: "盤差單", return: "退貨單" }[s.type] || "驗收單"} PDF 已產生` : ""}${s.type === "transfer" ? "，貨品在途，等目的地確認收貨" : ""}`);
       confirmAsk = false; await loadRemote(s.id); await refreshReceived(); render();
     } catch (e) { toast("入帳失敗：" + (e instanceof TypeError ? "沒有網路" : e.message)); yes.disabled = false; yes.textContent = "確認入帳"; }
   };

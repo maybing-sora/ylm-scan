@@ -560,6 +560,10 @@ function finalize_(id, person, reasons) {
   var sh = sheet_('sessions');
   sh.getRange(idx + 2, 11, 1, 4).setValues([['已確認', person || '', t, t]]);
   var res = { written: out.length, autoIssues: autoN };
+  if (type === '退貨' && out.length) {
+    try { res.doc = makeReturnPdf_(id, s, totals, P, person, t); }
+    catch (e) { res.docError = '退貨單 PDF 沒有產生：' + (e && e.message || e); }
+  }
   if (type === '盤點' && vr.length) {
     try { res.doc = makeVariancePdf_(id, s, vr, person, t); }
     catch (e) { res.docError = '盤差單 PDF 沒有產生：' + (e && e.message || e); }
@@ -845,6 +849,44 @@ function stockView_(loc) {
     else if (o['類型'] === '調撥' && !o['收貨時間']) transit.push({ id: o['單號'], from: o['地點'], to: o['目的地'], date: day_(o['作業日期']), items: sessionTotals_(o['單號']).totals });
   });
   return { items: bd.items, lastCount: bd.lastCount, salesLast: salesLast, pending: pending, transit: transit };
+}
+
+/* ============ 退貨單 ============ */
+
+function makeReturnPdf_(id, s, totals, P, person, t) {
+  var d = day_(s['作業日期']), vendor = s['廠商'] || '';
+  var name = '退貨單_' + d.replace(/-/g, '') + '_' + vendor + '_' + id;
+  var book = breakdown_(s['地點'], id).items, people = {};
+  rows_('scans').forEach(function (r) { if (String(r[1]) === String(id) && Number(r[6])) people[String(r[3] || '')] = 1; });
+  var codes = Object.keys(totals).sort(), qty = 0, buyAmt = 0, conQty = 0;
+  var cells = [['產品編號', '品名', '產品別', '帳面', '退貨數量', '進貨單價', '金額']];
+  codes.forEach(function (c) {
+    var p = P[c] || {}, q = totals[c], cost = Number(p.pc || 0), b = (book[c] || {}).exp || 0;
+    qty += q; if (p.t === '買斷') buyAmt += cost * q; else conQty += q;
+    cells.push([c, p.n || '', p.t || '', String(b), String(q), cost ? money_(cost) : '', cost ? money_(cost * q) : '']);
+  });
+  var doc = DocumentApp.create(name), body = doc.getBody();
+  body.setMarginTop(36).setMarginBottom(36).setMarginLeft(36).setMarginRight(36);
+  body.appendParagraph('六福棲蘭明池 商品退貨單').setHeading(DocumentApp.ParagraphHeading.HEADING1).setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+  styleTable_(body.appendTable([
+    ['退貨單號', id, '廠商', vendor],
+    ['退貨日期', d, '退貨地點', s['地點'] || ''],
+    ['退貨人', Object.keys(people).join('、') || '—', '品項／件數', codes.length + ' 項／' + qty + ' 件'],
+    ['確認人', person || '', '確認時間', String(t).replace('T', ' ').slice(0, 16)]
+  ]), 10, false);
+  if (s['備註']) body.appendParagraph('備註：' + s['備註']).setSpacingBefore(6);
+  styleTable_(body.appendTable(cells), 8, true);
+  if (buyAmt) body.appendParagraph('買斷品退貨金額（依進貨單價）：' + money_(buyAmt)).setBold(true).setSpacingBefore(8);
+  if (conQty) body.appendParagraph('寄售品退回 ' + conQty + ' 件：不計金額，自寄售庫存扣除。').setSpacingBefore(4);
+  body.appendParagraph('本單由點收盤點工具於退貨確認時產生。退貨人與確認人即為確認紀錄，不另簽名。')
+    .setFontSize(8).setForegroundColor('#666666').setSpacingBefore(12);
+  doc.saveAndClose();
+  var docFile = DriveApp.getFileById(doc.getId());
+  var pdf = docsFolder_().createFile(docFile.getAs('application/pdf').setName(name + '.pdf'));
+  docFile.setTrashed(true);
+  var url = 'https://drive.google.com/file/d/' + pdf.getId() + '/view';
+  sheet_('docs').appendRow([id, '退貨單', name + '.pdf', url, pdf.getId(), nowIso_()]);
+  return { name: name + '.pdf', url: url };
 }
 
 /* ============ 盤差單 ============ */
