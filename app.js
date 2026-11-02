@@ -254,6 +254,8 @@ function recounts(id) {
 }
 const statusLabel = s => s.type === "transfer" && s.status === "已確認" && !s.receivedAt ? "在途" : (s.status || "進行中");
 const bookOf = id => (remote[id] && remote[id].book) || null;
+// 已經從試算表讀過這張單、卻沒有帳面數：試算表的程式還是舊版
+const noBookMsg = id => remote[id] && remote[id].at ? "讀不到帳面數：試算表的 Apps Script 還是舊版，請 Echo 部署新版本後重新整理。" : "連上網路後會顯示帳面數。";
 let reasons = LS.get("reasons", {}); // 盤點單號 -> {產品編號: 原因}
 const SHORT_REASONS = ["疑似遺失", "破損報廢", "POS 銷售未貼", "調撥或退貨未入帳", "原因不明", "其他"];
 const OVER_REASONS = ["進貨或調入未入帳", "點到其他地點的貨", "POS 銷售多貼", "原因不明", "其他"];
@@ -477,7 +479,7 @@ function hitHTML() {
 function bookLineHTML(code) {
   const s = sessions[view.id], book = bookOf(view.id);
   if (!s || s.type === "receive") return "";
-  if (!book) return `<div class="small muted">連上網路後會顯示帳面數。</div>`;
+  if (!book) return `<div class="small muted">${noBookMsg(view.id)}</div>`;
   const b = book[code] || 0, g = totals(view.id).get(code), tot = g ? g.qty : 0;
   if (s.type === "count") return `<div class="small">帳面 <b class="mono">${b}</b>　全部區域已點 <b class="mono">${tot}</b>${tot !== b ? `　<span class="chip ${tot < b ? "warn" : "bad"}">${tot < b ? "還差 " + (b - tot) : "多 " + (tot - b)}</span>` : `　<span class="chip ok">相符</span>`}</div>`;
   return `<div class="small">「${esc(s.location)}」帳面 <b class="mono">${b}</b>　這張單共 <b class="mono">${tot}</b>${tot > b ? `　<span class="chip warn">超過帳面 ${tot - b}，請再確認數量</span>` : ""}</div>`;
@@ -485,7 +487,7 @@ function bookLineHTML(code) {
 let bookFilter = "todo", retFilter = "all";
 function retListHTML(s) {
   const book = bookOf(view.id);
-  if (!book) return `<p class="small muted" style="margin:0">連上網路後會顯示這家廠商的帳面品項。</p>`;
+  if (!book) return `<p class="small muted" style="margin:0">${noBookMsg(view.id)}</p>`;
   const t = totals(view.id), sh = sheets[sheetKey(view.id, view.zone)];
   let rows = P.filter(p => p.v === s.vendor && ((book[p.c] || 0) > 0 || t.has(p.c)))
     .map(p => ({ p, b: book[p.c] || 0, tot: (t.get(p.c) || {}).qty || 0, mine: (sh && sh.counts[p.c]) || 0 }));
