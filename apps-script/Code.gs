@@ -22,14 +22,16 @@ var TABS = {
   receipts: '驗收對帳',
   docs: '單據',
   log: '操作紀錄',
-  issueSum: '異常彙總'
+  issueSum: '異常彙總',
+  variances: '盤差對帳'
 };
 
 var HEADERS = {
-  sessions: ['單號', '類型', '作業日期', '進貨單日期', '地點', '目的地', '廠商', '備註', '建立人', '建立時間', '狀態', '確認人', '確認時間', '更新時間'],
+  sessions: ['單號', '類型', '作業日期', '進貨單日期', '地點', '目的地', '廠商', '備註', '建立人', '建立時間', '狀態', '確認人', '確認時間', '更新時間', '收貨人', '收貨時間'],
   scans: ['紀錄鍵', '單號', '區域', '人員', '裝置', '產品編號', '數量', '更新時間'],
   ledger: ['單號', '作業日期', '類型', '地點', '產品編號', '品名', '廠商', '數量', '人員', '寫入時間'],
-  counts: ['單號', '盤點日期', '地點', '產品編號', '品名', '帳面數', '實盤數', '差異', '確認人', '確認時間', '上次盤點', '進貨', '調入', '調出', '退貨', 'POS銷售'],
+  counts: ['單號', '盤點日期', '地點', '產品編號', '品名', '帳面數', '實盤數', '差異', '確認人', '確認時間', '上次盤點', '進貨', '調入', '調出', '退貨', 'POS銷售', '原因', '盤點人', '複盤數', '複盤人'],
+  variances: ['單號', '盤點日期', '地點', '廠商', '產品編號', '品名', '產品別', '帳面數', '實盤數', '差異', '進貨單價', '差異金額', '處理方式', '原因', '盤點人', '複盤人', '結案人', '結案時間'],
   receipts: ['單號', '驗收日期', '進貨單日期', '廠商', '產品編號', '品名', '產品別', '進貨單數量', '實收數量', '差異', '進貨單價', '應付金額', '異常', '照片', '驗收人', '確認入帳人', '確認時間'],
   docs: ['單號', '類型', '檔名', '網址', '檔案ID', '建立時間'],
   log: ['時間', '操作人', '動作', '單號', '內容', '裝置'],
@@ -87,6 +89,7 @@ function doGet(e) {
       case 'boot': return boot_();
       case 'session': return getSession_(p.id);
       case 'stock': return { stock: stockFor_(p.loc) };
+      case 'stockView': return stockView_(p.loc);
       case 'issues': return { issues: listIssues_() };
       case 'ping': return { ok: true };
       default: throw new Error('未知的動作');
@@ -110,10 +113,11 @@ function doPost(e) {
         case 'saveSheet': return saveSheet_(body);
         case 'saveIssue': return saveIssue_(body.issue);
         case 'savePhoto': return savePhoto_(body);
-        case 'finalize': return finalize_(body.id, who);
+        case 'finalize': return finalize_(body.id, who, body.reasons || {});
         case 'reopen': return reopen_(body.id);
         case 'deleteSession': return deleteSession_(body.id);
         case 'refreshReceipt': return refreshReceipt_(body.id);
+        case 'receiveTransfer': return receiveTransfer_(body.id, body.counts || {}, who);
         default: throw new Error('未知的動作');
       }
     } finally { lock.releaseLock(); }
@@ -151,7 +155,7 @@ function sheet_(key) {
     sh = ss.insertSheet(TABS[key]);
     sh.getRange(1, 1, 1, HEADERS[key].length).setValues([HEADERS[key]]).setFontWeight('bold');
     sh.setFrozenRows(1);
-    if (key === 'scans' || key === 'ledger' || key === 'counts' || key === 'issues' || key === 'sales' || key === 'stock') {
+    if (key === 'scans' || key === 'ledger' || key === 'counts' || key === 'issues' || key === 'sales' || key === 'stock' || key === 'variances') {
       var col = HEADERS[key].indexOf(key === 'sales' ? '產品編號或條碼' : '產品編號') + 1;
       if (col > 0) sh.getRange(2, col, sh.getMaxRows() - 1, 1).setNumberFormat('@');
     }
@@ -233,7 +237,8 @@ function loadProducts_() {
 /* ============ boot / 讀取 ============ */
 
 function boot_() {
-  var sessions = rows_('sessions').map(function (r) { return obj_('sessions', r); })
+  var tinIds = transferInIds_();
+  var sessions = rows_('sessions').map(function (r) { return sessionObj_(r, tinIds); })
     .sort(function (a, b) { return String(b['建立時間']).localeCompare(String(a['建立時間'])); })
     .slice(0, 150);
   var products = loadProducts_().map(function (p) { var o = {}; for (var k in p) if (k !== 'pc') o[k] = p[k]; return o; });
@@ -250,9 +255,47 @@ function receivedTotals_(excludeId) {
   return m;
 }
 
+// 調撥單有沒有收貨：有「收貨時間」，或舊版直接寫了調撥入的單
+function transferInIds_() {
+  var m = {};
+  rows_('ledger').forEach(function (r) { if (r[2] === '調撥入') m[String(r[0])] = 1; });
+  return m;
+}
+function sessionObj_(r, tinIds) {
+  var o = obj_('sessions', r);
+  if (o['類型'] === '調撥' && o['狀態'] === '已確認' && !o['收貨時間'] && tinIds[String(o['單號'])]) {
+    o['收貨人'] = o['收貨人'] || '（入帳時直接加到目的地）'; o['收貨時間'] = o['確認時間'];
+  }
+  return o;
+}
+
+// 一張單的數量：各區域加總；盤點的「複盤」區域會取代第一次的數量（同品項取最後一次複盤）
+function sessionTotals_(id) {
+  var first = {}, people = {}, rc = {}, rcBy = {}, rcAt = {};
+  rows_('scans').forEach(function (r) {
+    if (String(r[1]) !== String(id)) return;
+    var c = String(r[5]);
+    if (c.charAt(0) === '?') return; // 未知條碼不入帳
+    var q = Number(r[6] || 0), at = r[7] instanceof Date ? iso_(r[7]) : String(r[7]);
+    if (String(r[2]) === '複盤') {
+      if (!(c in rcAt) || at >= rcAt[c]) { rc[c] = q; rcBy[c] = String(r[3] || ''); rcAt[c] = at; }
+      return;
+    }
+    first[c] = (first[c] || 0) + q;
+    people[c] = people[c] || {};
+    people[c][String(r[3] || '未具名') + '（' + String(r[2] || '') + '）'] = 1;
+  });
+  var totals = {};
+  Object.keys(first).forEach(function (c) { if (first[c]) totals[c] = first[c]; });
+  Object.keys(rc).forEach(function (c) { if (rc[c]) totals[c] = rc[c]; else delete totals[c]; });
+  var ppl = {};
+  Object.keys(people).forEach(function (c) { ppl[c] = Object.keys(people[c]).join('、'); });
+  return { totals: totals, first: first, recount: rc, recountBy: rcBy, people: ppl };
+}
+
 function getSession_(id) {
-  var s = null;
-  rows_('sessions').forEach(function (r) { if (String(r[0]) === String(id)) s = obj_('sessions', r); });
+  var s = null, tinIds = transferInIds_();
+  rows_('sessions').forEach(function (r) { if (String(r[0]) === String(id)) s = sessionObj_(r, tinIds); });
   if (!s) throw new Error('找不到這張單');
   var sheets = {};
   rows_('scans').forEach(function (r) {
@@ -268,6 +311,15 @@ function getSession_(id) {
     out.breakdown = bd.items; out.lastCount = bd.lastCount;
     out.book = {};
     Object.keys(bd.items).forEach(function (c) { if (bd.items[c].exp) out.book[c] = bd.items[c].exp; });
+  } else if (s['類型'] === '調撥' || s['類型'] === '退貨') {
+    // 出貨地點的帳面數（不含這張單），用來提醒「數量超過帳面」
+    var b2 = breakdown_(s['地點'], id).items;
+    out.book = {};
+    Object.keys(b2).forEach(function (c) { if (b2[c].exp) out.book[c] = b2[c].exp; });
+    if (s['類型'] === '調撥') {
+      out.received = {};
+      rows_('ledger').forEach(function (r) { if (String(r[0]) === String(id) && r[2] === '調撥入') out.received[String(r[4])] = (out.received[String(r[4])] || 0) + Number(r[7] || 0); });
+    }
   }
   var d = docFor_(id); if (d) out.doc = d;
   return out;
@@ -287,7 +339,8 @@ function saveSession_(s) {
   for (var i = 0; i < data.length; i++) if (String(data[i][0]) === String(s.id)) { idx = i; break; }
   if (idx >= 0 && data[idx][10] === '已確認') throw new Error('這張單已確認入帳，請先重新開啟');
   var row = [s.id, TYPE_LABEL[s.type] || s.type, s.date || '', s.poDate || '', s.location || '', s.to || '', s.vendor || '', s.memo || '',
-    s.createdBy || '', s.createdAt || nowIso_(), idx >= 0 ? data[idx][10] : '進行中', idx >= 0 ? data[idx][11] : '', idx >= 0 ? data[idx][12] : '', nowIso_()];
+    s.createdBy || '', s.createdAt || nowIso_(), idx >= 0 ? data[idx][10] : '進行中', idx >= 0 ? data[idx][11] : '', idx >= 0 ? data[idx][12] : '', nowIso_(),
+    idx >= 0 ? data[idx][14] : '', idx >= 0 ? data[idx][15] : ''];
   if (idx >= 0) sh.getRange(idx + 2, 1, 1, row.length).setValues([row]);
   else sh.appendRow(row);
   log_(idx >= 0 ? '修改作業單' : '建立作業單', s.id, [row[1], row[4], row[5] ? '→' + row[5] : '', row[6], row[2]].filter(String).join(' '));
@@ -303,7 +356,7 @@ function saveSheet_(b) {
   var t = nowIso_(), rows = [];
   Object.keys(b.counts || {}).forEach(function (code) {
     var q = Number(b.counts[code] || 0);
-    if (q) rows.push([b.key, b.sessionId, b.zone || '', b.person || '', b.device || '', code, q, t]);
+    if (q || b.zone === '複盤') rows.push([b.key, b.sessionId, b.zone || '', b.person || '', b.device || '', code, q, t]);
   });
   replaceRows_('scans', function (r) { return String(r[0]) !== String(b.key); }, rows, 6);
   return { saved: rows.length };
@@ -417,8 +470,8 @@ function savePhoto_(b) {
 function authorizePhotos() {
   var step = function (name, fn) { var t0 = Date.now(); console.log('開始：' + name); var r = fn(); console.log('完成：' + name + '（' + (Date.now() - t0) + 'ms）'); return r; };
   step('異常回報照片欄', ensureIssuePhotoHeader_);
-  step('盤點紀錄欄位', function () { ensureHeader_('counts'); });
-  step('新分頁', function () { ['receipts', 'docs', 'log', 'issueSum'].forEach(function (k) { sheet_(k); }); });
+  step('盤點紀錄、作業單欄位', function () { ensureHeader_('counts'); ensureHeader_('sessions'); });
+  step('新分頁', function () { ['receipts', 'docs', 'log', 'issueSum', 'variances'].forEach(function (k) { sheet_(k); }); });
   var f = step('照片資料夾', photoFolder_);
   var d = step('驗收單資料夾', docsFolder_);
   step('Google 文件授權', function () { var tmp = DocumentApp.create('授權測試（可刪除）'); DriveApp.getFileById(tmp.getId()).setTrashed(true); });
@@ -436,20 +489,14 @@ function rebuildIssueSummary() {
 
 /* ============ 入帳（確認完成） ============ */
 
-function finalize_(id, person) {
+function finalize_(id, person, reasons) {
   var data = rows_('sessions'), idx = -1;
   for (var i = 0; i < data.length; i++) if (String(data[i][0]) === String(id)) { idx = i; break; }
   if (idx < 0) throw new Error('找不到這張單');
   var s = obj_('sessions', data[idx]);
   if (s['狀態'] === '已確認') return { already: true };
 
-  var totals = {};
-  rows_('scans').forEach(function (r) {
-    if (String(r[1]) !== String(id)) return;
-    var c = String(r[5]);
-    if (c.charAt(0) === '?') return; // 未知條碼不入帳
-    totals[c] = (totals[c] || 0) + Number(r[6] || 0);
-  });
+  var ST = sessionTotals_(id), totals = ST.totals;
 
   var P = {};
   loadProducts_().forEach(function (p) { P[p.c] = p; });
@@ -463,25 +510,44 @@ function finalize_(id, person) {
   else if (type === '退貨') Object.keys(totals).forEach(function (c) { add('退貨', s['地點'], c, -totals[c]); });
   else if (type === '調撥') {
     if (!s['目的地']) throw new Error('調撥單缺少目的地');
-    Object.keys(totals).forEach(function (c) { add('調撥出', s['地點'], c, -totals[c]); add('調撥入', s['目的地'], c, totals[c]); });
+    // 調撥分兩段：這裡只從出貨地點扣除，貨品「在途」，目的地收貨確認後才加到目的地
+    Object.keys(totals).forEach(function (c) { add('調撥出', s['地點'], c, -totals[c]); });
   } else if (type === '盤點') {
     var bd = breakdown_(s['地點'], id).items;
     var codes = {};
     Object.keys(bd).forEach(function (c) { codes[c] = 1; });
     Object.keys(totals).forEach(function (c) { codes[c] = 1; });
-    var cr = [];
+    var cr = [], missing = [], vr = [];
     Object.keys(codes).forEach(function (c) {
       var x = bd[c] || { open: 0, recv: 0, tin: 0, tout: 0, ret: 0, sales: 0, exp: 0 };
       var b = Number(x.exp || 0), n = Number(totals[c] || 0), d = n - b;
+      if (d && !String(reasons[c] || '').trim()) missing.push((P[c] || {}).n || c);
+    });
+    if (missing.length) throw new Error('還有 ' + missing.length + ' 個品項有差異但沒有填原因：' + missing.slice(0, 5).join('、') + (missing.length > 5 ? '…' : ''));
+    Object.keys(codes).forEach(function (c) {
+      var x = bd[c] || { open: 0, recv: 0, tin: 0, tout: 0, ret: 0, sales: 0, exp: 0 };
+      var b = Number(x.exp || 0), n = Number(totals[c] || 0), d = n - b, p = P[c] || {};
+      var why = d ? String(reasons[c] || '').trim() : '', rcq = c in ST.recount ? ST.recount[c] : '', rcb = ST.recountBy[c] || '';
       if (b || n || x.open || x.recv || x.tin || x.tout || x.ret || x.sales)
-        cr.push([id, date, s['地點'], c, (P[c] || {}).n || '', b, n, d, person || '', t, x.open, x.recv, x.tin, x.tout, x.ret, x.sales]);
-      if (d) add('盤差', s['地點'], c, d);
+        cr.push([id, date, s['地點'], c, p.n || '', b, n, d, person || '', t, x.open, x.recv, x.tin, x.tout, x.ret, x.sales, why, ST.people[c] || '', rcq, rcb]);
+      if (d) {
+        add('盤差', s['地點'], c, d);
+        var cost = Number(p.pc || 0), consign = p.t === '寄售';
+        var how = d > 0 ? '多出：待查明' : consign ? '寄售：依進貨單價付給廠商' : '買斷：認列存貨損失';
+        vr.push([id, date, s['地點'], p.v || '', c, p.n || '', p.t || '', b, n, d, cost || '', cost ? cost * d : '', how, why, ST.people[c] || '', rcb, person || '', t]);
+      }
     });
     if (cr.length) {
       ensureHeader_('counts');
       var csh = sheet_('counts'), cs = csh.getLastRow() + 1;
       csh.getRange(cs, 4, cr.length, 1).setNumberFormat('@');
       csh.getRange(cs, 1, cr.length, cr[0].length).setValues(cr);
+    }
+    if (vr.length) {
+      ensureHeader_('variances');
+      var vsh = sheet_('variances'), vs = vsh.getLastRow() + 1;
+      vsh.getRange(vs, 5, vr.length, 1).setNumberFormat('@');
+      vsh.getRange(vs, 1, vr.length, vr[0].length).setValues(vr);
     }
   }
   var receipt = null, autoN = 0;
@@ -494,6 +560,10 @@ function finalize_(id, person) {
   var sh = sheet_('sessions');
   sh.getRange(idx + 2, 11, 1, 4).setValues([['已確認', person || '', t, t]]);
   var res = { written: out.length, autoIssues: autoN };
+  if (type === '盤點' && vr.length) {
+    try { res.doc = makeVariancePdf_(id, s, vr, person, t); }
+    catch (e) { res.docError = '盤差單 PDF 沒有產生：' + (e && e.message || e); }
+  }
   log_('確認入帳', id, type + ' ' + s['地點'] + (s['目的地'] ? '→' + s['目的地'] : '') + (s['廠商'] ? ' ' + s['廠商'] : '') + '，寫入 ' + out.length + ' 筆異動');
   if (receipt) {
     var rsh = sheet_('receipts'), rs = rsh.getLastRow() + 1;
@@ -514,11 +584,13 @@ function reopen_(id) {
   replaceRows_('ledger', function (r) { return String(r[0]) !== String(id); }, [], 5);
   replaceRows_('counts', function (r) { return String(r[0]) !== String(id); }, [], 4);
   replaceRows_('receipts', function (r) { return String(r[0]) !== String(id); }, [], 5);
+  replaceRows_('variances', function (r) { return String(r[0]) !== String(id); }, [], 5);
   rows_('docs').forEach(function (r) {
     if (String(r[0]) === String(id)) { try { DriveApp.getFileById(String(r[4])).setTrashed(true); } catch (e) {} }
   });
   replaceRows_('docs', function (r) { return String(r[0]) !== String(id); }, [], 0);
-  sheet_('sessions').getRange(idx + 2, 11, 1, 4).setValues([['進行中', '', '', nowIso_()]]);
+  ensureHeader_('sessions');
+  sheet_('sessions').getRange(idx + 2, 11, 1, 6).setValues([['進行中', '', '', nowIso_(), '', '']]);
   withdrawAutoIssues_(id);
   log_('重新開啟', id, '撤回入帳、驗收單與自動標示的異常');
   return {};
@@ -650,7 +722,7 @@ function docFor_(id) {
   return d;
 }
 
-var money_ = function (n) { return '$' + Math.round(Number(n) || 0).toLocaleString('en-US'); };
+var money_ = function (n) { var v = Math.round(Number(n) || 0); return (v < 0 ? '-$' : '$') + Math.abs(v).toLocaleString('en-US'); };
 
 // 用 Google 文件排版，再轉成 PDF 存到「點收盤點_驗收單」資料夾
 // 已入帳的驗收單：依最新的異常狀態重新產生驗收對帳與 PDF，不動庫存
@@ -660,11 +732,7 @@ function refreshReceipt_(id) {
   if (!s) throw new Error('找不到這張單');
   if (s['類型'] !== '驗收') throw new Error('只有驗收單有驗收單 PDF');
   if (s['狀態'] !== '已確認') throw new Error('這張單還沒確認入帳');
-  var totals = {};
-  rows_('scans').forEach(function (r) {
-    if (String(r[1]) !== String(id) || String(r[5]).charAt(0) === '?') return;
-    totals[String(r[5])] = (totals[String(r[5])] || 0) + Number(r[6] || 0);
-  });
+  var totals = sessionTotals_(id).totals;
   var P = {};
   loadProducts_().forEach(function (p) { P[p.c] = p; });
   var person = s['確認人'] || '', t = s['確認時間'] || nowIso_();
@@ -727,6 +795,103 @@ function makeReceiptPdf_(id, s, receipt, person, t, updated) {
   docFile.setTrashed(true);
   var url = 'https://drive.google.com/file/d/' + pdf.getId() + '/view';
   sheet_('docs').appendRow([id, '驗收單', name + '.pdf', url, pdf.getId(), nowIso_()]);
+  return { name: name + '.pdf', url: url };
+}
+
+/* ============ 調撥收貨 ============ */
+
+// 目的地收貨確認：依實收數量加到目的地；和出貨數不同的品項記在操作紀錄，並回傳差異
+function receiveTransfer_(id, counts, who) {
+  var data = rows_('sessions'), idx = -1;
+  for (var i = 0; i < data.length; i++) if (String(data[i][0]) === String(id)) { idx = i; break; }
+  if (idx < 0) throw new Error('找不到這張單');
+  var s = sessionObj_(data[idx], transferInIds_());
+  if (s['類型'] !== '調撥') throw new Error('只有調撥單需要收貨確認');
+  if (s['狀態'] !== '已確認') throw new Error('出貨地點還沒確認出貨');
+  if (s['收貨時間']) throw new Error('這張調撥單已經收貨確認過了');
+  var shipped = sessionTotals_(id).totals, P = {};
+  loadProducts_().forEach(function (p) { P[p.c] = p; });
+  var t = nowIso_(), date = t.slice(0, 10), out = [], diffs = [];
+  var codes = {};
+  Object.keys(shipped).forEach(function (c) { codes[c] = 1; });
+  Object.keys(counts).forEach(function (c) { codes[c] = 1; });
+  Object.keys(codes).forEach(function (c) {
+    var got = Math.max(0, Math.round(Number(counts[c] != null ? counts[c] : shipped[c]) || 0)), sent = shipped[c] || 0, p = P[c] || {};
+    if (got) out.push([id, date, '調撥入', s['目的地'], c, p.n || '', p.v || '', got, who, t]);
+    if (got !== sent) diffs.push((p.n || c) + ' 出貨 ' + sent + '、收到 ' + got);
+  });
+  if (out.length) {
+    var lsh = sheet_('ledger'), ls = lsh.getLastRow() + 1;
+    lsh.getRange(ls, 5, out.length, 1).setNumberFormat('@');
+    lsh.getRange(ls, 1, out.length, out[0].length).setValues(out);
+  }
+  ensureHeader_('sessions');
+  sheet_('sessions').getRange(idx + 2, 14, 1, 3).setValues([[t, who, t]]);
+  log_('調撥收貨', id, s['地點'] + '→' + s['目的地'] + '，' + (diffs.length ? '數量不符：' + diffs.join('；') : '數量相符'));
+  return { received: out.length, diffs: diffs };
+}
+
+/* ============ 庫存查詢 ============ */
+
+function stockView_(loc) {
+  if (!loc) throw new Error('請選地點');
+  var bd = breakdown_(loc), salesLast = '';
+  rows_('sales').forEach(function (r) { if (String(r[1]).trim() === String(loc)) { var d = day_(r[0]); if (d > salesLast) salesLast = d; } });
+  var tinIds = transferInIds_(), pending = [], transit = [];
+  rows_('sessions').forEach(function (r) {
+    var o = sessionObj_(r, tinIds);
+    if (o['地點'] !== loc && o['目的地'] !== loc) return;
+    if (o['狀態'] !== '已確認') pending.push({ id: o['單號'], type: o['類型'], date: day_(o['作業日期']), from: o['地點'], to: o['目的地'] });
+    else if (o['類型'] === '調撥' && !o['收貨時間']) transit.push({ id: o['單號'], from: o['地點'], to: o['目的地'], date: day_(o['作業日期']), items: sessionTotals_(o['單號']).totals });
+  });
+  return { items: bd.items, lastCount: bd.lastCount, salesLast: salesLast, pending: pending, transit: transit };
+}
+
+/* ============ 盤差單 ============ */
+
+function makeVariancePdf_(id, s, vr, person, t) {
+  var cd = day_(s['作業日期']);
+  var name = '盤差單_' + cd.replace(/-/g, '') + '_' + s['地點'] + '_' + id;
+  var doc = DocumentApp.create(name), body = doc.getBody();
+  body.setMarginTop(36).setMarginBottom(36).setMarginLeft(36).setMarginRight(36);
+  body.appendParagraph('六福棲蘭明池 盤點差異單').setHeading(DocumentApp.ParagraphHeading.HEADING1).setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+  var counters = {}, recounters = {};
+  vr.forEach(function (r) { String(r[14] || '').split('、').forEach(function (x) { if (x) counters[x] = 1; }); if (r[15]) recounters[r[15]] = 1; });
+  styleTable_(body.appendTable([
+    ['盤點單號', id, '盤點地點', s['地點'] || ''],
+    ['盤點日期', cd, '差異品項', vr.length + ' 項'],
+    ['盤點人（區域）', Object.keys(counters).join('、') || '—', '複盤人', Object.keys(recounters).join('、') || '—'],
+    ['結案人', person || '', '結案時間', String(t).replace('T', ' ').slice(0, 16)]
+  ]), 10, false);
+  var head = ['產品編號', '品名', '廠商', '產品別', '帳面', '實盤', '差異', '進貨單價', '差異金額', '原因', '盤點人'];
+  var cells = [head].concat(vr.map(function (r) {
+    return [r[4], r[5], r[3], r[6], String(r[7]), String(r[8]), r[9] > 0 ? '+' + r[9] : String(r[9]),
+      r[10] === '' ? '' : money_(r[10]), r[11] === '' ? '' : money_(r[11]), r[13], r[14] + (r[15] ? '；複盤 ' + r[15] : '')];
+  }));
+  styleTable_(body.appendTable(cells), 8, true);
+  // 小計：寄售短少依廠商（付給廠商）、買斷短少（存貨損失）、多出（待查明）
+  var byVendor = {}, loss = 0, lossQty = 0, over = 0;
+  vr.forEach(function (r) {
+    var d = Number(r[9]), amt = Number(r[11] || 0);
+    if (d > 0) { over += d; return; }
+    if (r[6] === '寄售') { var v = r[3] || '（無廠商）'; byVendor[v] = byVendor[v] || { q: 0, a: 0 }; byVendor[v].q += -d; byVendor[v].a += -amt; }
+    else { loss += -amt; lossQty += -d; }
+  });
+  var vk = Object.keys(byVendor);
+  if (vk.length) {
+    body.appendParagraph('寄售品盤損：依進貨單價付給廠商').setHeading(DocumentApp.ParagraphHeading.HEADING3);
+    styleTable_(body.appendTable([['廠商', '短少件數', '應付金額']].concat(vk.map(function (v) { return [v, String(byVendor[v].q), money_(byVendor[v].a)]; }))), 9, true);
+  }
+  if (lossQty) body.appendParagraph('買斷品盤損：短少 ' + lossQty + ' 件，存貨損失 ' + money_(loss) + '（會計科目待財務確認）。').setBold(true).setSpacingBefore(8);
+  if (over) body.appendParagraph('盤盈（多出）' + over + ' 件：不計金額，查明原因後再處理。').setSpacingBefore(4);
+  body.appendParagraph('本單由點收盤點工具於盤點結案時產生。盤點人、複盤人與結案人即為確認紀錄，不另簽名。')
+    .setFontSize(8).setForegroundColor('#666666').setSpacingBefore(12);
+  doc.saveAndClose();
+  var docFile = DriveApp.getFileById(doc.getId());
+  var pdf = docsFolder_().createFile(docFile.getAs('application/pdf').setName(name + '.pdf'));
+  docFile.setTrashed(true);
+  var url = 'https://drive.google.com/file/d/' + pdf.getId() + '/view';
+  sheet_('docs').appendRow([id, '盤差單', name + '.pdf', url, pdf.getId(), nowIso_()]);
   return { name: name + '.pdf', url: url };
 }
 
@@ -815,6 +980,13 @@ function refreshStockSheet() {
       var q = all[loc][c];
       if (q) rows.push([loc, c, (P[c] || {}).n || '', (P[c] || {}).v || '', q]);
     });
+  });
+  var tinIds = transferInIds_();
+  rows_('sessions').forEach(function (r) {
+    var o = sessionObj_(r, tinIds);
+    if (o['類型'] !== '調撥' || o['狀態'] !== '已確認' || o['收貨時間']) return;
+    var tt = sessionTotals_(o['單號']).totals;
+    Object.keys(tt).forEach(function (c) { rows.push(['在途（' + o['地點'] + '→' + o['目的地'] + '，' + o['單號'] + '）', c, (P[c] || {}).n || '', (P[c] || {}).v || '', tt[c]]); });
   });
   var sh = sheet_('stock');
   if (sh.getLastRow() > 1) sh.getRange(2, 1, sh.getLastRow() - 1, HEADERS.stock.length).clearContent();

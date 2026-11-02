@@ -150,6 +150,8 @@ async function flush() {
       queue.shift(); saveLocal();
     }
     lastError = ""; online = true;
+    // 結果頁的「確認入帳」按鈕在上傳完成後才能按，上傳完就重畫一次
+    if (view.name === "session" && view.tab === "res") render(true);
   } catch (e) {
     if (e.code === "pin") { lastError = "密碼錯誤"; pin = ""; LS.set("pin", ""); render(); }
     else if (e instanceof TypeError) { online = false; scheduleFlush(15000); }
@@ -200,14 +202,14 @@ function dropLocal(id) {
 }
 function fromRow(s) {
   return { id: s["單號"], type: TYPE_BY_LABEL[s["類型"]] || "count", date: day(s["作業日期"]), poDate: day(s["進貨單日期"]), location: s["地點"], to: s["目的地"],
-    vendor: s["廠商"], memo: s["備註"], createdBy: s["建立人"], createdAt: s["建立時間"], status: s["狀態"] || "進行中", confirmedBy: s["確認人"], confirmedAt: s["確認時間"] };
+    vendor: s["廠商"], memo: s["備註"], createdBy: s["建立人"], createdAt: s["建立時間"], status: s["狀態"] || "進行中", confirmedBy: s["確認人"], confirmedAt: s["確認時間"], receivedBy: s["收貨人"] || "", receivedAt: s["收貨時間"] || "" };
 }
 async function loadRemote(id) {
   if (!API || !pin) return;
   try {
     const j = await apiGet({ a: "session", id });
-    remote[id] = { sheets: j.sheets || {}, issues: j.issues || [], book: j.book || null, breakdown: j.breakdown || null, lastCount: j.lastCount || null, doc: j.doc || null, at: nowIso() };
-    if (j.session) { const s = fromRow(j.session); if (!sessions[id] || !sessions[id]._local) sessions[id] = s; else sessions[id].status = s.status; }
+    remote[id] = { sheets: j.sheets || {}, issues: j.issues || [], book: j.book || null, breakdown: j.breakdown || null, lastCount: j.lastCount || null, doc: j.doc || null, received: j.received || null, at: nowIso() };
+    if (j.session) { const s = fromRow(j.session); if (!sessions[id] || !sessions[id]._local) sessions[id] = s; else { sessions[id].status = s.status; sessions[id].receivedAt = s.receivedAt; sessions[id].receivedBy = s.receivedBy; } }
     LS.set("remote", remote); saveLocal(); online = true;
   } catch (e) { if (e instanceof TypeError) online = false; }
   setSync();
@@ -219,9 +221,11 @@ function sheetsFor(id) {
   for (const [k, sh] of Object.entries(sheets)) if (sh.sessionId === id) m[k] = sh;
   return m;
 }
+const RECOUNT = "複盤";
 function totals(id) {
   const t = new Map();
   for (const sh of Object.values(sheetsFor(id))) {
+    if (sh.zone === RECOUNT) continue;
     for (const [code, q] of Object.entries(sh.counts || {})) {
       if (!q) continue;
       const r = t.get(code) || { qty: 0, zones: {}, people: new Set() };
@@ -231,6 +235,24 @@ function totals(id) {
   }
   return t;
 }
+
+// 盤點的複盤：同品項取最後一次複盤的數量（可以是 0）
+function recounts(id) {
+  const m = {};
+  for (const sh of Object.values(sheetsFor(id))) {
+    if (sh.zone !== RECOUNT) continue;
+    for (const [code, q] of Object.entries(sh.counts || {})) {
+      const at = sh.updatedAt || "";
+      if (!m[code] || at >= m[code].at) m[code] = { qty: +q || 0, person: sh.person || "", at };
+    }
+  }
+  return m;
+}
+const statusLabel = s => s.type === "transfer" && s.status === "已確認" && !s.receivedAt ? "在途" : (s.status || "進行中");
+const bookOf = id => (remote[id] && remote[id].book) || null;
+let reasons = LS.get("reasons", {}); // 盤點單號 -> {產品編號: 原因}
+const SHORT_REASONS = ["疑似遺失", "破損報廢", "POS 銷售未貼", "調撥或退貨未入帳", "原因不明", "其他"];
+const OVER_REASONS = ["進貨或調入未入帳", "點到其他地點的貨", "POS 銷售多貼", "原因不明", "其他"];
 
 /* ================= 畫面 ================= */
 let view = { name: "home" };
@@ -243,6 +265,7 @@ function go(v) {
   render(); window.scrollTo(0, 0);
   if (v.name === "session") loadRemote(v.id).then(() => { if (view.name === "session" && view.id === v.id) render(true); });
   if (v.name === "issues") loadIssues();
+  if (v.name === "stock") loadStock(v.loc);
 }
 function render(soft) {
   const hdr = document.getElementById("hdr");
@@ -251,6 +274,7 @@ function render(soft) {
   if (view.name === "home") { hdr.textContent = "棲蘭明池 點收盤點"; app.innerHTML = homeHTML(); bindHome(); }
   else if (view.name === "new") { hdr.textContent = "新增" + TYPES[view.type].label; app.innerHTML = newHTML(); bindNew(); }
   else if (view.name === "issues") { hdr.textContent = "異常清單"; app.innerHTML = issuesHTML(); bindIssues(); }
+  else if (view.name === "stock") { hdr.textContent = "庫存查詢"; app.innerHTML = stockHTML(); bindStock(); }
   else if (view.name === "session") {
     const s = sessions[view.id]; if (!s) { view = { name: "home" }; render(); return; }
     hdr.textContent = `${TYPES[s.type].label} · ${s.location}${s.type === "transfer" ? " → " + (s.to || "") : ""}`;
@@ -287,7 +311,7 @@ function homeHTML() {
   <section class="panel">
     <label>操作人<input id="person" value="${esc(person)}" placeholder="輸入你的名字" autocomplete="name"></label>
     <div class="modes">${Object.entries(TYPES).map(([k, t]) => `<button class="mode" data-new="${k}"><b>＋ ${t.label}</b><span class="small muted">${t.desc}</span></button>`).join("")}</div>
-    <div class="row"><button class="grow" id="toIssues">異常清單</button><button id="reload">重新整理</button></div>
+    <div class="row"><button class="grow" id="toStock">庫存查詢</button><button class="grow" id="toIssues">異常清單</button><button id="reload">重新整理</button></div>
     <p class="small muted" style="margin:0">商品主檔 ${P.length} 項，直接讀取進貨料號表。${P.filter(p => !p.bc).length} 項沒有廠商條碼，請掃六福標籤。</p>
   </section>
   <section style="display:flex;flex-direction:column;gap:8px">
@@ -297,7 +321,7 @@ function homeHTML() {
       return `<button class="sess" data-id="${esc(s.id)}">
         <span class="chip ${TYPES[s.type].chip}">${TYPES[s.type].label}</span>
         <span class="grow"><b>${esc(s.location)}${s.type === "transfer" ? " → " + esc(s.to) : ""}</b>${s.vendor ? " · " + esc(s.vendor) : ""}<br>
-        <span class="small muted">${esc(s.date)} · ${esc(s.createdBy || "")} · ${esc(s.status || "進行中")}</span></span>
+        <span class="small muted">${esc(s.date)} · ${esc(s.createdBy || "")} · ${esc(statusLabel(s))}</span></span>
         <span class="mono">${n} 件</span></button>`;
     }).join("") : `<div class="note">還沒有作業單。選上面的「驗收」「調撥」「退貨」或「盤點」開始。</div>`}
   </section>`;
@@ -311,6 +335,7 @@ function bindHome() {
     go({ name: "new", type: b.dataset.new });
   });
   document.getElementById("toIssues").onclick = () => go({ name: "issues" });
+  document.getElementById("toStock").onclick = () => go({ name: "stock", loc: LS.get("stockLoc", LOCS[0] || "") });
   document.getElementById("reload").onclick = () => boot();
   app.querySelectorAll(".sess").forEach(b => b.onclick = () => go({ name: "session", id: b.dataset.id, tab: "scan", zone: LS.get("zone." + b.dataset.id, "整區") }));
 }
@@ -382,8 +407,8 @@ function bump(code, delta, setTo) {
 function sessionHTML(s) {
   return `
   <section class="panel" style="gap:8px">
-    <div class="row"><span class="chip ${TYPES[s.type].chip}">${TYPES[s.type].label}${s.type === "count" ? "（盲盤）" : ""}</span>
-      <span class="chip ${locked(s) ? "ok" : ""}">${esc(s.status || "進行中")}</span>
+    <div class="row"><span class="chip ${TYPES[s.type].chip}">${TYPES[s.type].label}</span>
+      <span class="chip ${statusLabel(s) === "在途" ? "warn" : locked(s) ? "ok" : ""}">${esc(statusLabel(s))}</span>
       <span class="grow small muted">${s.vendor ? esc(s.vendor) + " · " : ""}作業日 ${esc(s.date)}${s.poDate ? " · 進貨單 " + esc(s.poDate) : ""}${s.memo ? " · " + esc(s.memo) : ""}<br>${esc(s.id)} · ${esc(s.createdBy || "")}</span>
       <button class="ghost sm" id="home">返回</button></div>
     <div class="tabs" role="tablist">
@@ -394,7 +419,7 @@ function sessionHTML(s) {
   ${view.tab === "scan" ? scanHTML(s) : `<div id="resultBox" style="display:flex;flex-direction:column;gap:16px">${resultInner(s)}</div>`}`;
 }
 function scanHTML(s) {
-  if (locked(s)) return `<div class="note">這張單已在 ${esc(fmt(s.confirmedAt))} 由 ${esc(s.confirmedBy || "")} 確認入帳。要修改請到「結果與入帳」按「重新開啟」。</div>`;
+  if (locked(s)) return `<div class="note">這張單已在 ${esc(fmt(s.confirmedAt))} 由 ${esc(s.confirmedBy || "")} 確認入帳。${s.type === "transfer" && !s.receivedAt ? `貨品在途中，「${esc(s.to)}」收到後請到「結果與入帳」按「確認收貨」。` : "要修改請到「結果與入帳」按「重新開啟」。"}</div>`;
   return `
   <section class="panel">
     <div class="row">
@@ -418,7 +443,11 @@ function scanHTML(s) {
   : `<section class="panel">
     <h3 id="mineTitle"></h3>
     <div id="mine" class="list"></div>
-  </section>`}`;
+  </section>
+  ${s.type === "count" ? `<section class="panel"><div class="row"><h3 class="grow">帳面清單（${esc(s.location)}）</h3>
+    <div class="filters"><button aria-pressed="${bookFilter === "todo"}" data-bf="todo">未點</button><button aria-pressed="${bookFilter === "diff"}" data-bf="diff">有差異</button><button aria-pressed="${bookFilter === "all"}" data-bf="all">全部</button></div></div>
+    <span class="small muted">帳面數是上次盤點加減之後的進出算出來的。每一項都要實際點過；點完數量和帳面不同，結案前要複盤或填原因。</span>
+    <div id="booklist" class="list"></div></section>` : ""}`}`;
 }
 function hitHTML() {
   if (!lastHit) return "";
@@ -430,10 +459,36 @@ function hitHTML() {
     <div class="small muted">${esc(p.b)} · ${esc(p.cat)}</div>
     <div class="nm">${esc(p.n)}</div>
     <div class="small mono muted">六福 ${p.c}${p.bc ? ` · 廠商 ${esc(p.bc)}` : " · 無廠商條碼"}${p.p ? " · $" + p.p : ""}</div>
+    ${bookLineHTML(p.c)}
     <div class="row"><span class="grow small">「${esc(view.zone)}」已記</span>
       <div class="qty"><button aria-label="減 1" data-d="-1">−</button><input id="hitQty" type="number" min="0" value="${mine}"><button aria-label="加 1" data-d="1">＋</button></div></div>
     ${issueOpen ? issueFormHTML(p) : `<div class="row"><button class="sm" id="openIssue">回報異常</button></div>`}
   </div>`;
+}
+// 帳面數提示：盤點顯示帳面與全部區域已點；退貨、調撥顯示出貨地點帳面，超過時提醒
+function bookLineHTML(code) {
+  const s = sessions[view.id], book = bookOf(view.id);
+  if (!s || s.type === "receive") return "";
+  if (!book) return `<div class="small muted">連上網路後會顯示帳面數。</div>`;
+  const b = book[code] || 0, g = totals(view.id).get(code), tot = g ? g.qty : 0;
+  if (s.type === "count") return `<div class="small">帳面 <b class="mono">${b}</b>　全部區域已點 <b class="mono">${tot}</b>${tot !== b ? `　<span class="chip ${tot < b ? "warn" : "bad"}">${tot < b ? "還差 " + (b - tot) : "多 " + (tot - b)}</span>` : `　<span class="chip ok">相符</span>`}</div>`;
+  return `<div class="small">「${esc(s.location)}」帳面 <b class="mono">${b}</b>　這張單共 <b class="mono">${tot}</b>${tot > b ? `　<span class="chip warn">超過帳面 ${tot - b}，請再確認數量</span>` : ""}</div>`;
+}
+let bookFilter = "todo";
+function bookListHTML(s) {
+  const book = bookOf(view.id);
+  if (!book) return `<p class="small muted" style="margin:0">連上網路後會顯示帳面清單。</p>`;
+  const t = totals(view.id);
+  const codes = new Set(Object.keys(book).filter(c => book[c] > 0));
+  for (const c of t.keys()) if (byCode.has(c)) codes.add(c);
+  let rows = [...codes].map(c => { const p = byCode.get(c) || { c, n: "（主檔已無此品項）" }, b = book[c] || 0, g = t.get(c), q = g ? g.qty : 0; return { p, b, q, done: !!g }; });
+  const todo = rows.filter(r => !r.done).length, diff = rows.filter(r => r.done && r.q !== r.b).length;
+  if (bookFilter === "todo") rows = rows.filter(r => !r.done); else if (bookFilter === "diff") rows = rows.filter(r => r.done && r.q !== r.b);
+  rows.sort((a, b) => String(a.p.n).localeCompare(String(b.p.n), "zh-Hant"));
+  return `<p class="small" style="margin:0">共 ${codes.size} 項，未點 <b>${todo}</b> 項，有差異 <b>${diff}</b> 項。</p>` +
+    (rows.map(r => `<div class="item"><span class="grow"><span class="name">${esc(r.p.n)}</span><br><span class="small mono muted">${esc(r.p.c)}</span></span>
+      <span class="mono small" style="text-align:right">帳面 <b>${r.b}</b><br>已點 <b>${r.done ? r.q : "—"}</b></span>
+      <button class="sm" data-pickbook="${esc(r.p.c)}">記錄</button></div>`).join("") || `<p class="small muted" style="margin:0">${bookFilter === "todo" ? "全部都點過了。" : "沒有品項。"}</p>`);
 }
 // 拍照區塊：key 用來區分是哪個表單
 const formPhotos = {}; // key -> [{id, dataUrl}]
@@ -503,7 +558,9 @@ function mineHTML() {
   if (!entries.length) return `<p class="small muted" style="margin:0">還沒有紀錄。</p>`;
   return entries.slice().reverse().map(([code, q]) => {
     const p = byCode.get(code);
-    return `<div class="item"><span class="grow"><span class="name">${p ? esc(p.n) : "未知條碼"}</span><br><span class="small mono muted">${p ? p.c : esc(code.replace(/^\?/, ""))}</span></span>
+    const s0 = sessions[view.id], bk = bookOf(view.id), tq = (totals(view.id).get(code) || {}).qty || 0;
+    const ob = s0 && (s0.type === "transfer" || s0.type === "return") && bk && p ? (tq > (bk[code] || 0) ? `<br><span class="chip warn">超過帳面（帳面 ${bk[code] || 0}）</span>` : `<br><span class="small muted">帳面 ${bk[code] || 0}</span>`) : "";
+    return `<div class="item"><span class="grow"><span class="name">${p ? esc(p.n) : "未知條碼"}</span><br><span class="small mono muted">${p ? p.c : esc(code.replace(/^\?/, ""))}</span>${ob}</span>
       <div class="qty"><button data-c="${esc(code)}" data-d="-1" aria-label="減 1">−</button><input type="number" min="0" value="${q}" data-c="${esc(code)}"><button data-c="${esc(code)}" data-d="1" aria-label="加 1">＋</button></div></div>`;
   }).join("");
 }
@@ -598,6 +655,16 @@ function refreshScanParts() {
   const h = document.getElementById("hit"); if (h) { h.innerHTML = hitHTML(); bindHit(s); bindPhotoBoxes(h); }
   const m = document.getElementById("mine"); if (m) { m.innerHTML = mineHTML(); bindMine(); }
   const e = document.getElementById("expect"); if (e) { e.innerHTML = expectHTML(s); bindExpect(); bindPhotoBoxes(e); }
+  const bl = document.getElementById("booklist"); if (bl) {
+    bl.innerHTML = bookListHTML(s);
+    bl.querySelectorAll("[data-pickbook]").forEach(b => b.onclick = () => {
+      const p = byCode.get(b.dataset.pickbook); if (!p) return;
+      lastHit = { p }; issueOpen = false; refreshScanParts();
+      const h = document.getElementById("hit"); if (h && h.scrollIntoView) h.scrollIntoView({ block: "center" });
+      const q = document.getElementById("hitQty"); if (q) { q.focus(); q.select(); }
+    });
+  }
+  document.querySelectorAll("[data-bf]").forEach(b => b.onclick = () => { bookFilter = b.dataset.bf; document.querySelectorAll("[data-bf]").forEach(x => x.setAttribute("aria-pressed", x.dataset.bf === bookFilter)); refreshScanParts(); });
 }
 function bindHit(s) {
   const h = document.getElementById("hit");
@@ -848,7 +915,7 @@ function bindSession(s) {
   ci.oninput = () => {
     const m = suggest(ci.value, pool);
     if (!m.length) { sugg.innerHTML = ci.value.trim().length >= 2 ? `<p class="small muted" style="margin:0">沒有符合的品項。</p>` : ""; return; }
-    sugg.innerHTML = m.map(({ p, how }) => `<div class="item"><span class="grow"><span class="name">${esc(p.n)}</span><br><span class="small mono muted">${hl(p.c, ci.value)}${p.bc ? " · " + hl(p.bc, ci.value) : ""} · ${how}</span></span><button class="sm" data-pick="${p.c}">＋1</button></div>`).join("");
+    sugg.innerHTML = m.map(({ p, how }) => `<div class="item"><span class="grow"><span class="name">${esc(p.n)}</span><br><span class="small mono muted">${hl(p.c, ci.value)}${p.bc ? " · " + hl(p.bc, ci.value) : ""} · ${how}</span>${bookOf(view.id) ? `<br><span class="small">帳面 ${bookOf(view.id)[p.c] || 0}</span>` : ""}</span><button class="sm" data-pick="${p.c}">＋1</button></div>`).join("");
     sugg.querySelectorAll("[data-pick]").forEach(b => b.onclick = () => { handleCode(b.dataset.pick, "manual"); ci.value = ""; clearSugg(); ci.focus(); });
   };
   form.onsubmit = e => {
@@ -864,7 +931,7 @@ function bindSession(s) {
 }
 
 /* ---- 結果與入帳 ---- */
-const ST = { ok: ["ok", "相符"], short: ["warn", "短少"], over: ["bad", "多出"], none: ["", "未掃到"], counted: ["ok", "已記錄"], extra: ["info", "非應收品項"], unknown: ["bad", "未知條碼"], zero: ["", "已售完"] };
+const ST = { ok: ["ok", "相符"], short: ["warn", "短少"], over: ["bad", "多出"], none: ["", "未點到"], counted: ["ok", "已記錄"], extra: ["info", "非應收品項"], unknown: ["bad", "未知條碼"], zero: ["", "已售完"], overbook: ["warn", "超過帳面"] };
 function resultRows(s) {
   const t = totals(view.id), rows = [], seenC = new Set();
   const book = remote[view.id] && remote[view.id].book;
@@ -876,13 +943,20 @@ function resultRows(s) {
       rows.push({ p, qty, ref, st: qty === ref ? "ok" : qty === 0 ? "none" : qty < ref ? "short" : "over", g });
     }
   } else if (s.type === "count" && book) {
-    const bd = (remote[view.id] && remote[view.id].breakdown) || {};
-    const codes = new Set(Object.keys(book).concat(Object.keys(bd).filter(c => Object.values(bd[c]).some(v => v))));
+    const bd = (remote[view.id] && remote[view.id].breakdown) || {}, rc = recounts(view.id);
+    const codes = new Set(Object.keys(book).concat(Object.keys(bd).filter(c => Object.values(bd[c]).some(v => v))).concat(Object.keys(rc)));
     for (const code of codes) {
       const g = t.get(code); seenC.add(code);
       const p = byCode.get(code) || { c: code, n: "（主檔已無此品項）", b: "", v: "" };
-      const qty = g ? g.qty : 0, b = book[code] || 0;
-      rows.push({ p, qty, ref: b, bd: bd[code], st: qty === b ? (b ? "ok" : "zero") : qty === 0 ? "none" : qty < b ? "short" : "over", g });
+      const first = g ? g.qty : 0, b = book[code] || 0, re = rc[code];
+      const qty = re ? re.qty : first;
+      rows.push({ p, qty, first, re, ref: b, bd: bd[code], st: qty === b ? (b ? "ok" : "zero") : qty === 0 ? "none" : qty < b ? "short" : "over", g });
+    }
+  } else if ((s.type === "transfer" || s.type === "return") && book) {
+    for (const [code, g] of t) {
+      const p = byCode.get(code); if (!p) continue; seenC.add(code);
+      const b = book[code] || 0;
+      rows.push({ p, qty: g.qty, ref: b, bd: null, st: g.qty > b ? "overbook" : "counted", g });
     }
   }
   for (const [code, g] of t) {
@@ -890,12 +964,21 @@ function resultRows(s) {
     const p = byCode.get(code);
     const unknown = !p;
     const ref = s.type === "count" && book ? 0 : null;
-    rows.push({ p: p || { c: code.replace(/^\?/, ""), n: "未知條碼", b: "", v: "" }, qty: g.qty, ref, bd: null,
+    rows.push({ p: p || { c: code.replace(/^\?/, ""), n: "未知條碼", b: "", v: "" }, qty: g.qty, first: g.qty, ref, bd: null,
       st: unknown ? "unknown" : s.type === "receive" ? "extra" : (ref === 0 ? "over" : "counted"), g });
   }
   return rows.map(r => Object.assign(r, { zones: r.g ? r.g.zones : {}, people: r.g ? [...r.g.people] : [] }));
 }
 function autoWarnHTML(s, rows) {
+  if (s.type === "count") {
+    const none = rows.filter(r => r.st === "none").length, sh = rows.filter(r => r.st === "short").length, ov = rows.filter(r => r.st === "over").length;
+    if (!none && !sh && !ov) return `<span class="small">全部品項都和帳面相符。</span>`;
+    return `<span class="small" style="color:var(--bad)">${none ? `${none} 個品項帳面有、但完全沒點到，最可能是漏點。` : ""}${sh ? `${sh} 個短少。` : ""}${ov ? `${ov} 個多出。` : ""}這些差異會記成盤差並產生盤差單，請確認都已複盤或填好原因。</span>`;
+  }
+  if (s.type === "transfer" || s.type === "return") {
+    const ob = rows.filter(r => r.st === "overbook");
+    return ob.length ? `<span class="small" style="color:var(--warn)">${ob.length} 個品項的數量超過「${esc(s.location)}」帳面：${ob.slice(0, 4).map(r => esc(r.p.n)).join("、")}${ob.length > 4 ? "…" : ""}。請再確認數量；帳面也可能因為銷售沒貼或之前的單沒入帳而不準。</span>` : "";
+  }
   if (s.type !== "receive") return "";
   const none = rows.filter(r => r.st === "none").length, diff = rows.filter(r => r.st === "short" || r.st === "over").length;
   if (!none && !diff) return "";
@@ -905,6 +988,7 @@ const BD_COLS = [["open", "上次盤點"], ["recv", "＋進貨"], ["tin", "＋�
 function resultInner(s) {
   const isCount = s.type === "count";
   const rows = resultRows(s), hasRef = s.type === "receive" || (s.type === "count" && remote[view.id] && remote[view.id].book);
+  const showBook = (s.type === "transfer" || s.type === "return") && !!bookOf(view.id);
   const total = rows.reduce((a, x) => a + x.qty, 0);
   const keys = [...new Set(rows.map(r => r.st))];
   const shown = rows.filter(x => resultFilter === "all" || x.st === resultFilter);
@@ -914,9 +998,9 @@ function resultInner(s) {
   const autoWarn = autoWarnHTML(s, rows);
   const fin = {
     receive: "確認後，實收數量會記入「" + s.location + "」的庫存。",
-    transfer: `確認後，會從「${s.location}」扣除並加到「${s.to}」。`,
+    transfer: `確認後，會從「${s.location}」扣除，貨品變成「在途」；「${s.to}」收到後按「確認收貨」，才會加到「${s.to}」。`,
     return: `確認後，會從「${s.location}」的庫存扣除。`,
-    count: `確認後，差異會記為盤差，「${s.location}」的帳面數改成這次的盤點數。`
+    count: `確認後，差異會記為盤差並產生盤差單 PDF，「${s.location}」的帳面數改成這次的盤點數。`
   }[s.type];
   return `
   <section class="stats">
@@ -924,10 +1008,12 @@ function resultInner(s) {
     ${keys.map(k => `<div class="stat"><span class="small muted">${ST[k][1]}</span><b>${rows.filter(r => r.st === k).length}</b></div>`).join("")}
   </section>
   ${s.type === "count" && !(remote[view.id] && remote[view.id].book) ? `<div class="note">連上網路後會顯示帳面數並比對。</div>` : ""}
+  ${s.type === "count" && !locked(s) && remote[view.id] && remote[view.id].book ? diffPanelHTML(s, rows) : ""}
+  ${s.type === "transfer" && locked(s) ? transferRecvHTML(s, rows) : ""}
   ${s.type === "count" ? `<div class="note">應有 = 上次盤點 ＋ 進貨 ＋ 調入 − 調出 − 退貨 − POS 銷售。${(remote[view.id] && remote[view.id].lastCount) ? `上次盤點是 ${esc(remote[view.id].lastCount.date)}。` : "這個地點還沒有盤點過，從第一筆進貨開始算。"}POS 銷售要先貼到試算表「POS銷售」分頁，差異才會準。</div>` : ""}
   <section class="panel" style="gap:8px">
     <div class="row"><h3 class="grow">參與紀錄</h3><button class="ghost sm" id="refresh">重新整理</button></div>
-    ${sh.length ? sh.map(x => `<div class="row small"><span class="grow">${esc(x.person || "未具名")} · ${esc(x.zone)}</span><span class="mono">${Object.values(x.counts || {}).reduce((a, b) => a + b, 0)} 件</span><span class="muted">${esc(fmt(x.updatedAt))}</span></div>`).join("") : `<p class="small muted" style="margin:0">還沒有人開始掃描。</p>`}
+    ${sh.length ? sh.map(x => `<div class="row small"><span class="grow">${esc(x.person || "未具名")} · ${esc(x.zone)}</span><span class="mono">${Object.values(x.counts || {}).reduce((a, b) => a + b, 0)} 件</span><span class="muted">${esc(fmt(x.updatedAt))}</span></div>`).join("") : `<p class="small muted" style="margin:0">還沒有人開始記錄。</p>`}
     ${issues.length ? `<p class="small" style="margin:0">異常回報 ${issues.length} 筆：${issues.map(i => esc(i["品名"]) + "（" + esc(i["異常類型"]) + "）").join("、")}</p>` : ""}
   </section>
   <div class="filters" role="group" aria-label="篩選">
@@ -939,22 +1025,23 @@ function resultInner(s) {
       const parts = BD_COLS.filter(([k]) => k === "open" || b[k]).map(([k, l]) => `${k === "open" ? "上次" : l} ${b[k] || 0}`).join("　");
       return `<div class="item" style="align-items:flex-start">
         <span class="grow"><span class="name">${esc(x.p.n)}</span><br><span class="small mono muted">${esc(x.p.c)}</span><br>
-        <span class="small mono">${parts}　＝ 應有 <b>${x.ref ?? 0}</b></span></span>
+        <span class="small mono">${parts}　＝ 應有 <b>${x.ref ?? 0}</b></span>${x.people.length ? `<br><span class="small muted">盤點人：${esc(x.people.join("、"))}${x.re ? `　複盤：${esc(x.re.person)}（第一次 ${x.first}）` : ""}</span>` : x.re ? `<br><span class="small muted">複盤：${esc(x.re.person)}</span>` : ""}</span>
         <span style="text-align:right;display:flex;flex-direction:column;align-items:flex-end;gap:4px"><span class="mono">實盤 <b>${x.qty}</b></span>
         <span class="mono small">${d > 0 ? "+" : ""}${d}</span><span class="chip ${ST[x.st][0]}">${ST[x.st][1]}</span></span></div>`;
     }).join("") || `<p class="muted">沒有品項。</p>`}</div></section>` : `<div class="tablewrap"><table>
-    <thead><tr><th>品項</th>${isCount && hasRef ? BD_COLS.map(([, l]) => `<th class="num">${l}</th>`).join("") + `<th class="num">應有</th><th class="num">實盤</th>` : `<th>區域</th><th class="num">本次</th>`}${hasRef && !isCount ? `<th class="num">應收</th>` : ""}${hasRef ? `<th class="num">差異</th>` : ""}<th>狀態</th></tr></thead>
+    <thead><tr><th>品項</th>${isCount && hasRef ? BD_COLS.map(([, l]) => `<th class="num">${l}</th>`).join("") + `<th class="num">應有</th><th class="num">實盤</th>` : `<th>區域</th><th class="num">本次</th>`}${hasRef && !isCount ? `<th class="num">應收</th>` : ""}${showBook ? `<th class="num">帳面</th>` : ""}${hasRef ? `<th class="num">差異</th>` : ""}<th>狀態</th></tr></thead>
     <tbody>${shown.map(x => `<tr>
       <td><span class="name">${esc(x.p.n)}</span><br><span class="small mono muted">${esc(x.p.c)}</span></td>
       ${isCount && hasRef ? BD_COLS.map(([k]) => `<td class="num">${x.bd ? x.bd[k] || "" : ""}</td>`).join("") + `<td class="num"><b>${x.ref ?? 0}</b></td><td class="num">${x.qty}</td>`
         : `<td class="small">${Object.entries(x.zones).map(([z, q]) => `${esc(z)} ${q}`).join("<br>") || "—"}</td><td class="num">${x.qty}</td>`}
       ${hasRef && !isCount ? `<td class="num">${x.ref ?? "—"}</td>` : ""}
+      ${showBook ? `<td class="num">${x.ref ?? "—"}</td>` : ""}
       ${hasRef ? `<td class="num">${x.ref == null ? "—" : (x.qty - x.ref > 0 ? "+" : "") + (x.qty - x.ref)}</td>` : ""}
       <td><span class="chip ${ST[x.st][0]}">${ST[x.st][1]}</span></td></tr>`).join("") || `<tr><td colspan="6" class="muted">沒有品項。</td></tr>`}</tbody>
   </table></div>`}
   <section class="row"><button class="grow" id="copy">複製表格</button></section>
   ${locked(s) ? `<section class="panel"><p style="margin:0">已在 ${esc(fmt(s.confirmedAt))} 由 ${esc(s.confirmedBy || "")} 確認入帳。</p>
-      ${remote[view.id] && remote[view.id].doc ? `<a class="primary" href="${esc(remote[view.id].doc.url)}" target="_blank" rel="noopener" style="display:block;text-align:center;padding:12px;border-radius:8px;background:var(--accent);color:var(--accent-fg);text-decoration:none;font-weight:700">開啟驗收單 PDF</a><p class="small muted" style="margin:0">PDF 存在 Drive「點收盤點_驗收單」資料夾，可以直接轉給財務。</p>` : ""}
+      ${remote[view.id] && remote[view.id].doc ? `<a class="primary" href="${esc(remote[view.id].doc.url)}" target="_blank" rel="noopener" style="display:block;text-align:center;padding:12px;border-radius:8px;background:var(--accent);color:var(--accent-fg);text-decoration:none;font-weight:700">開啟${s.type === "count" ? "盤差單" : "驗收單"} PDF</a><p class="small muted" style="margin:0">PDF 存在 Drive「點收盤點_驗收單」資料夾，可以直接轉給財務。</p>` : ""}
       ${s.type === "receive" && !confirmAsk ? `<div class="panel" style="gap:8px">${whoFieldHTML("whoDoc")}<button id="refreshDoc">更新驗收單</button><span class="small muted">在異常清單改過狀態（已解決、誤報撤回）後按這裡，會依最新狀態重新產生 PDF，不影響庫存，也不用重新開啟。</span></div>` : ""}
       ${confirmAsk ? `<div class="confirm"><b>確定要重新開啟？</b><span class="small">這張單寫入的庫存異動會被撤回，可以繼續修改後再確認一次。</span>${whoFieldHTML("whoAct")}<div class="row"><button id="no">取消</button><button class="danger grow" id="yesReopen">重新開啟</button></div></div>` : `<button class="danger" id="reopen">重新開啟</button>`}</section>`
     : `<section class="panel">
@@ -986,9 +1073,17 @@ function bindResult(s) {
     try {
       await flush();
       if (queue.length) throw new Error("還有資料沒有上傳");
-      const j = await apiPost({ a: "finalize", id: s.id, person });
+      let rs = {};
+      if (s.type === "count") {
+        const diffs = resultRows(s).filter(r => r.qty !== (r.ref || 0) && byCode.has(r.p.c));
+        const mine = reasons[s.id] || {};
+        const miss = diffs.filter(r => !mine[r.p.c]);
+        if (miss.length) { confirmAsk = false; render(true); toast(`還有 ${miss.length} 個品項有差異、沒有填原因：${miss.slice(0, 3).map(r => r.p.n).join("、")}`); const d = document.getElementById("diffPanel"); if (d && d.scrollIntoView) d.scrollIntoView(); return; }
+        diffs.forEach(r => rs[r.p.c] = mine[r.p.c]);
+      }
+      const j = await apiPost({ a: "finalize", id: s.id, person, reasons: rs });
       s.status = "已確認"; s.confirmedBy = person; s.confirmedAt = nowIso(); delete s._local; saveLocal();
-      toast(j.already ? "這張單之前已經入帳" : j.docError ? `已入帳，但${j.docError}` : `已入帳，寫入 ${j.written} 筆異動${j.autoIssues ? `，自動標示 ${j.autoIssues} 項數量異常` : ""}${j.doc ? "，驗收單 PDF 已產生" : ""}`);
+      toast(j.already ? "這張單之前已經入帳" : j.docError ? `已入帳，但${j.docError}` : `已入帳，寫入 ${j.written} 筆異動${j.autoIssues ? `，自動標示 ${j.autoIssues} 項數量異常` : ""}${j.doc ? `，${s.type === "count" ? "盤差單" : "驗收單"} PDF 已產生` : ""}${s.type === "transfer" ? "，貨品在途，等目的地確認收貨" : ""}`);
       confirmAsk = false; await loadRemote(s.id); await refreshReceived(); render();
     } catch (e) { toast("入帳失敗：" + (e instanceof TypeError ? "沒有網路" : e.message)); yes.disabled = false; yes.textContent = "確認入帳"; }
   };
@@ -1000,6 +1095,7 @@ function bindResult(s) {
       toast("驗收單已更新"); await loadRemote(s.id); render(true);
     } catch (e) { toast("更新失敗：" + (e instanceof TypeError ? "沒有網路" : e.message)); rd.disabled = false; rd.textContent = "更新驗收單"; }
   };
+  bindDiffPanel(s); bindTransferRecv(s);
   const dl = document.getElementById("del"); if (dl) dl.onclick = () => { deleteAsk = true; render(true); };
   const nd = document.getElementById("noDel"); if (nd) nd.onclick = () => { deleteAsk = false; render(true); };
   const yd = document.getElementById("yesDel"); if (yd) yd.onclick = async () => {
@@ -1016,11 +1112,138 @@ function bindResult(s) {
     yr.disabled = true;
     try {
       await apiPost({ a: "reopen", id: s.id });
-      s.status = "進行中"; saveLocal(); toast("已重新開啟"); confirmAsk = false;
+      s.status = "進行中"; s.receivedAt = ""; s.receivedBy = ""; saveLocal(); toast("已重新開啟"); confirmAsk = false;
       await refreshReceived(); await loadRemote(s.id); render();
     } catch (e) { toast("無法重新開啟：" + (e instanceof TypeError ? "沒有網路" : e.message)); yr.disabled = false; }
   };
 }
+/* ---- 盤點差異：複盤與原因 ---- */
+function diffPanelHTML(s, rows) {
+  const d = rows.filter(r => (r.first !== r.ref || r.re) && byCode.has(r.p.c));
+  if (!d.length) return `<section class="panel" id="diffPanel"><h3>差異處理</h3><p class="small muted" style="margin:0">目前沒有差異，可以直接確認入帳。</p></section>`;
+  const mine = reasons[s.id] || {};
+  const left = d.filter(r => r.qty !== (r.ref || 0) && !mine[r.p.c]).length;
+  return `<section class="panel" id="diffPanel" style="gap:8px">
+    <div class="row"><h3 class="grow">差異處理（${d.length} 項）</h3>${left ? `<span class="chip bad">還有 ${left} 項沒填原因</span>` : `<span class="chip ok">都處理好了</span>`}</div>
+    <span class="small muted">有差異的品項，最好請另一個人重點一次，把數量填在「複盤」。複盤數和帳面一樣就不算盤差；還是有差異的，選一個原因才能結案。</span>
+    ${whoFieldHTML("whoRe")}
+    <div class="list">${d.map(r => {
+      const c = r.p.c, dd = r.qty - (r.ref || 0), opts = dd < 0 ? SHORT_REASONS : OVER_REASONS;
+      return `<div class="item" style="align-items:flex-start">
+        <span class="grow" style="min-width:180px"><span class="name">${esc(r.p.n)}</span><br><span class="small mono muted">${esc(c)}</span><br>
+          <span class="small">帳面 <b>${r.ref || 0}</b>　第一次 <b>${r.first}</b>${r.people.length ? `（${esc(r.people.join("、"))}）` : "（沒點到）"}</span><br>
+          <span class="small">${dd === 0 ? `<span class="chip ok">複盤後相符</span>` : `<span class="chip ${dd < 0 ? "warn" : "bad"}">${dd < 0 ? "短少 " + -dd : "多出 " + dd}</span>`}${r.re ? `　複盤人 ${esc(r.re.person)}` : ""}</span></span>
+        <span style="display:flex;flex-direction:column;gap:6px;min-width:150px">
+          <label style="min-width:0">複盤數<input type="number" min="0" inputmode="numeric" data-rc="${esc(c)}" value="${r.re ? r.re.qty : ""}" placeholder="重點後填"></label>
+          ${dd !== 0 ? `<label style="min-width:0">原因<select data-why="${esc(c)}"><option value="">請選擇</option>${opts.map(o => `<option ${mine[c] === o ? "selected" : ""}>${o}</option>`).join("")}</select></label>` : ""}
+        </span></div>`;
+    }).join("")}</div></section>`;
+}
+function bindDiffPanel(s) {
+  document.querySelectorAll("[data-why]").forEach(sel => sel.onchange = () => {
+    reasons[s.id] = reasons[s.id] || {};
+    if (sel.value) reasons[s.id][sel.dataset.why] = sel.value; else delete reasons[s.id][sel.dataset.why];
+    LS.set("reasons", reasons); render(true);
+  });
+  document.querySelectorAll("[data-rc]").forEach(inp => inp.onchange = () => {
+    if (!takeWho("whoRe")) { inp.value = ""; return; }
+    const k = `${s.id}|${device}|${RECOUNT}`;
+    const sh = sheets[k] = sheets[k] || { sessionId: s.id, zone: RECOUNT, person, device, counts: {}, updatedAt: nowIso() };
+    const v = inp.value.trim();
+    if (v === "") delete sh.counts[inp.dataset.rc]; else sh.counts[inp.dataset.rc] = Math.max(0, Math.round(+v || 0));
+    sh.person = person; sh.updatedAt = nowIso(); saveLocal();
+    enqueue("saveSheet", k, { sessionId: s.id, key: k, zone: RECOUNT, person, device, counts: sh.counts });
+    toast("已記錄複盤"); render(true);
+  });
+}
+
+/* ---- 調撥：目的地收貨確認 ---- */
+let recvEdit = {};
+function transferRecvHTML(s, rows) {
+  const t = totals(view.id);
+  if (s.receivedAt) {
+    const got = (remote[view.id] && remote[view.id].received) || null;
+    const diffs = got ? [...t].filter(([c, g]) => (got[c] || 0) !== g.qty) : [];
+    return `<section class="panel" style="gap:8px"><h3>收貨確認</h3><p style="margin:0">「${esc(s.to)}」已在 ${esc(fmt(s.receivedAt))} 由 ${esc(s.receivedBy)} 確認收貨。</p>
+      ${diffs.length ? `<div class="note warn">收到的數量和出貨不同：${diffs.map(([c, g]) => `${esc((byCode.get(c) || { n: c }).n)} 出貨 ${g.qty}、收到 ${got[c] || 0}`).join("；")}。差額不在任何地點的庫存裡，請追查。</div>` : got ? `<p class="small muted" style="margin:0">收到的數量和出貨相符。</p>` : ""}</section>`;
+  }
+  const ed = recvEdit[s.id] = recvEdit[s.id] || {};
+  return `<section class="panel" style="gap:8px;border-color:var(--warn)"><h3>「${esc(s.to)}」確認收貨</h3>
+    <span class="small muted">貨品在途中。「${esc(s.to)}」收到後，逐項確認實收數量（預設等於出貨數），再按「確認收貨」，才會加到「${esc(s.to)}」的庫存。</span>
+    <div class="list">${[...t].map(([c, g]) => { const p = byCode.get(c) || { n: c }; return `<div class="item"><span class="grow"><span class="name">${esc(p.n)}</span><br><span class="small mono muted">${esc(c)}　出貨 ${g.qty}</span></span>
+      <label style="min-width:0;flex:0 0 110px">實收<input type="number" min="0" inputmode="numeric" data-recv="${esc(c)}" value="${ed[c] ?? g.qty}"></label></div>`; }).join("")}</div>
+    ${whoFieldHTML("whoRecv")}
+    <button class="primary big" id="doRecv">確認收貨</button></section>`;
+}
+function bindTransferRecv(s) {
+  document.querySelectorAll("[data-recv]").forEach(i => i.onchange = () => { (recvEdit[s.id] = recvEdit[s.id] || {})[i.dataset.recv] = Math.max(0, Math.round(+i.value || 0)); });
+  const b = document.getElementById("doRecv"); if (!b) return;
+  b.onclick = async () => {
+    if (!takeWho("whoRecv")) return;
+    const counts = {};
+    for (const [c, g] of totals(view.id)) counts[c] = (recvEdit[s.id] || {})[c] ?? g.qty;
+    b.disabled = true; b.textContent = "處理中…";
+    try {
+      const j = await apiPost({ a: "receiveTransfer", id: s.id, counts });
+      s.receivedAt = nowIso(); s.receivedBy = person; saveLocal(); delete recvEdit[s.id];
+      toast(j.diffs && j.diffs.length ? `已收貨，${j.diffs.length} 項數量和出貨不同` : "已收貨，數量相符");
+      await loadRemote(s.id); render();
+    } catch (e) { toast("收貨失敗：" + (e instanceof TypeError ? "沒有網路" : e.message)); b.disabled = false; b.textContent = "確認收貨"; }
+  };
+}
+
+/* ---- 庫存查詢 ---- */
+let stockData = LS.get("stockData", {}), stockFilter = "", stockOpen = null;
+async function loadStock(loc) {
+  if (!loc || !API || !pin) return;
+  try {
+    const j = await apiGet({ a: "stockView", loc });
+    stockData[loc] = { items: j.items || {}, lastCount: j.lastCount, salesLast: j.salesLast, pending: j.pending || [], transit: j.transit || [], at: nowIso() };
+    LS.set("stockData", stockData);
+  } catch (e) { if (e instanceof TypeError) online = false; else toast("讀取庫存失敗：" + e.message); }
+  if (view.name === "stock" && view.loc === loc) render();
+}
+function stockHTML() {
+  const loc = view.loc, d = stockData[loc];
+  const head = `<section class="panel"><div class="row"><label>地點<select id="stLoc">${locOptions(loc)}</select></label><button id="stReload" style="align-self:flex-end">重新整理</button><button class="ghost sm" id="stHome" style="align-self:flex-end">返回</button></div>
+    <input id="stFlt" value="${esc(stockFilter)}" placeholder="找品項：品名、產品編號或廠商條碼" autocomplete="off"></section>`;
+  if (!d) return head + `<p class="muted">讀取中…</p>`;
+  const items = Object.entries(d.items).filter(([, x]) => x.exp || x.recv || x.tin || x.tout || x.ret || x.sales || x.open);
+  let list = items.map(([c, x]) => ({ p: byCode.get(c) || { c, n: "（主檔已無此品項）", b: "", v: "" }, x }));
+  if (stockFilter.trim()) { const m = new Set(suggest(stockFilter, list.map(r => r.p), 999).map(r => r.p.c)); list = list.filter(r => m.has(r.p.c)); }
+  list.sort((a, b) => String(a.p.n).localeCompare(String(b.p.n), "zh-Hant"));
+  const total = items.reduce((a, [, x]) => a + (x.exp || 0), 0);
+  const tin = d.transit.filter(t => t.to === loc), tout = d.transit.filter(t => t.from === loc);
+  const warn = [];
+  warn.push(d.salesLast ? `POS 銷售貼到 ${esc(d.salesLast)}，之後的銷售還沒扣。` : `「POS銷售」分頁還沒有這個地點的銷售資料，帳面數沒有扣掉銷售。`);
+  if (d.pending.length) warn.push(`有 ${d.pending.length} 張單還沒確認入帳（${d.pending.slice(0, 4).map(p => esc(p.type) + " " + esc(p.date)).join("、")}${d.pending.length > 4 ? "…" : ""}），數量還沒算進來。`);
+  return head + `
+  <section class="stats">
+    <div class="stat"><span class="small muted">品項</span><b>${items.filter(([, x]) => x.exp).length}</b></div>
+    <div class="stat"><span class="small muted">帳面件數</span><b>${total}</b></div>
+    <div class="stat"><span class="small muted">上次盤點</span><b style="font-size:16px">${d.lastCount ? esc(d.lastCount.date) : "—"}</b></div>
+  </section>
+  <div class="note warn">${warn.join("<br>")}</div>
+  ${tin.length || tout.length ? `<section class="panel" style="gap:6px"><h3>在途</h3>${tin.map(t => `<button class="sess" data-sid="${esc(t.id)}"><span class="chip warn">待收貨</span><span class="grow small">從「${esc(t.from)}」調入 · ${esc(t.date)} · ${Object.values(t.items).reduce((a, b) => a + b, 0)} 件</span></button>`).join("")}${tout.map(t => `<button class="sess" data-sid="${esc(t.id)}"><span class="chip">已出貨</span><span class="grow small">調往「${esc(t.to)}」· ${esc(t.date)} · ${Object.values(t.items).reduce((a, b) => a + b, 0)} 件</span></button>`).join("")}</section>` : ""}
+  <section class="panel" style="gap:0"><div class="list">${list.map(({ p, x }) => {
+    const open = stockOpen === p.c;
+    return `<div class="item" data-st="${esc(p.c)}" style="cursor:pointer"><span class="grow"><span class="name">${esc(p.n)}</span><br><span class="small mono muted">${esc(p.c)}${p.v ? " · " + esc(p.v) : ""}</span>
+      ${open ? `<br><span class="small mono">${BD_COLS.map(([k, l]) => `${k === "open" ? "上次盤點" : l} ${x[k] || 0}`).join("　")}</span>` : ""}</span>
+      <span class="mono" style="font-size:18px"><b>${x.exp}</b></span></div>`;
+  }).join("") || `<p class="muted">沒有品項。</p>`}</div></section>
+  <p class="small muted">帳面數 = 上次盤點 ＋ 進貨 ＋ 調入 − 調出 − 退貨 − POS 銷售。點品項可以看算式。在途的貨不算在出貨地點，也還沒算進目的地。</p>`;
+}
+function bindStock() {
+  const sel = document.getElementById("stLoc");
+  sel.onchange = () => { view.loc = sel.value; LS.set("stockLoc", view.loc); stockOpen = null; render(); loadStock(view.loc); };
+  document.getElementById("stReload").onclick = () => loadStock(view.loc);
+  document.getElementById("stHome").onclick = () => go({ name: "home" });
+  const f = document.getElementById("stFlt");
+  f.oninput = () => { stockFilter = f.value; const pos = f.selectionStart; render(); const g = document.getElementById("stFlt"); g.focus(); try { g.setSelectionRange(pos, pos); } catch (e) {} };
+  app.querySelectorAll("[data-st]").forEach(r => r.onclick = () => { stockOpen = stockOpen === r.dataset.st ? null : r.dataset.st; render(); });
+  app.querySelectorAll("[data-sid]").forEach(b => b.onclick = () => go({ name: "session", id: b.dataset.sid, tab: "res", zone: "整區" }));
+}
+
 async function refreshReceived() {
   try { const j = await apiGet({ a: "boot" }); RECEIVED = j.received || {}; const m = LS.get("master", {}); m.received = RECEIVED; LS.set("master", m); } catch (e) {}
 }
