@@ -146,7 +146,11 @@ async function flush() {
         const still = new Set(queue.slice(1).flatMap(x => (x.body.issue && x.body.issue.photoIds) || []));
         q.body.issue.photoIds.forEach(id => { if (!still.has(id)) photoDel(id); });
       }
-      if (q.op === "saveSession" && sessions[q.key]) delete sessions[q.key]._local;
+      if (q.op === "saveSession" && sessions[q.key]) {
+        delete sessions[q.key]._local;
+        // 新開的單上傳後，才拿得到帳面數
+        if (view.name === "session" && view.id === q.key && !(remote[q.key] && remote[q.key].book)) loadRemote(q.key).then(() => { if (view.name === "session" && view.id === q.key) render(true); });
+      }
       queue.shift(); saveLocal();
     }
     lastError = ""; online = true;
@@ -444,6 +448,10 @@ function scanHTML(s) {
     <h3 id="mineTitle"></h3>
     <div id="mine" class="list"></div>
   </section>
+  ${s.type === "return" ? `<section class="panel"><div class="row"><h3 class="grow">退貨清單（${esc(s.vendor)}）</h3>
+    <div class="filters"><button aria-pressed="${retFilter === "all"}" data-rf="all">全部</button><button aria-pressed="${retFilter === "picked"}" data-rf="picked">已填數量</button></div></div>
+    <span class="small muted">列出「${esc(s.location)}」帳面上有的 ${esc(s.vendor)} 品項。直接在要退的品項填數量，或按 ＋／−。</span>
+    <div id="retlist" class="list"></div></section>` : ""}
   ${s.type === "count" ? `<section class="panel"><div class="row"><h3 class="grow">帳面清單（${esc(s.location)}）</h3>
     <div class="filters"><button aria-pressed="${bookFilter === "todo"}" data-bf="todo">未點</button><button aria-pressed="${bookFilter === "diff"}" data-bf="diff">有差異</button><button aria-pressed="${bookFilter === "all"}" data-bf="all">全部</button></div></div>
     <span class="small muted">帳面數是上次盤點加減之後的進出算出來的。每一項都要實際點過；點完數量和帳面不同，結案前要複盤或填原因。</span>
@@ -474,7 +482,23 @@ function bookLineHTML(code) {
   if (s.type === "count") return `<div class="small">帳面 <b class="mono">${b}</b>　全部區域已點 <b class="mono">${tot}</b>${tot !== b ? `　<span class="chip ${tot < b ? "warn" : "bad"}">${tot < b ? "還差 " + (b - tot) : "多 " + (tot - b)}</span>` : `　<span class="chip ok">相符</span>`}</div>`;
   return `<div class="small">「${esc(s.location)}」帳面 <b class="mono">${b}</b>　這張單共 <b class="mono">${tot}</b>${tot > b ? `　<span class="chip warn">超過帳面 ${tot - b}，請再確認數量</span>` : ""}</div>`;
 }
-let bookFilter = "todo";
+let bookFilter = "todo", retFilter = "all";
+function retListHTML(s) {
+  const book = bookOf(view.id);
+  if (!book) return `<p class="small muted" style="margin:0">連上網路後會顯示這家廠商的帳面品項。</p>`;
+  const t = totals(view.id), sh = sheets[sheetKey(view.id, view.zone)];
+  let rows = P.filter(p => p.v === s.vendor && ((book[p.c] || 0) > 0 || t.has(p.c)))
+    .map(p => ({ p, b: book[p.c] || 0, tot: (t.get(p.c) || {}).qty || 0, mine: (sh && sh.counts[p.c]) || 0 }));
+  const picked = rows.filter(r => r.tot).length, sum = rows.reduce((a, r) => a + r.tot, 0);
+  if (retFilter === "picked") rows = rows.filter(r => r.tot);
+  rows.sort((a, b) => String(a.p.n).localeCompare(String(b.p.n), "zh-Hant"));
+  const avail = P.filter(p => p.v === s.vendor && (book[p.c] || 0) > 0).length;
+  return `<p class="small" style="margin:0">帳面上有 ${avail} 項，已填 <b>${picked}</b> 項、共 <b>${sum}</b> 件。</p>` +
+    (rows.map(r => `<div class="item"><span class="grow"><span class="name">${esc(r.p.n)}</span><br><span class="small mono muted">${esc(r.p.c)}</span><br>
+      <span class="small">帳面 <b class="mono">${r.b}</b>${r.tot !== r.mine ? `　全部共 ${r.tot}` : ""}${r.tot > r.b ? `　<span class="chip warn">超過帳面 ${r.tot - r.b}</span>` : ""}</span></span>
+      <div class="qty"><button data-rc2="${esc(r.p.c)}" data-d="-1" aria-label="減 1">−</button><input type="number" min="0" inputmode="numeric" value="${r.mine}" data-rq="${esc(r.p.c)}"><button data-rc2="${esc(r.p.c)}" data-d="1" aria-label="加 1">＋</button></div></div>`).join("")
+      || `<p class="small muted" style="margin:0">${retFilter === "picked" ? "還沒有填數量的品項。" : "這家廠商在這個地點沒有帳面庫存。"}</p>`);
+}
 function bookListHTML(s) {
   const book = bookOf(view.id);
   if (!book) return `<p class="small muted" style="margin:0">連上網路後會顯示帳面清單。</p>`;
@@ -664,6 +688,12 @@ function refreshScanParts() {
       const q = document.getElementById("hitQty"); if (q) { q.focus(); q.select(); }
     });
   }
+  const rl = document.getElementById("retlist"); if (rl) {
+    rl.innerHTML = retListHTML(s);
+    rl.querySelectorAll("button[data-rc2]").forEach(b => b.onclick = () => { bump(b.dataset.rc2, +b.dataset.d); refreshScanParts(); });
+    rl.querySelectorAll("input[data-rq]").forEach(i => i.onchange = () => { bump(i.dataset.rq, 0, +i.value || 0); refreshScanParts(); });
+  }
+  document.querySelectorAll("[data-rf]").forEach(b => b.onclick = () => { retFilter = b.dataset.rf; document.querySelectorAll("[data-rf]").forEach(x => x.setAttribute("aria-pressed", x.dataset.rf === retFilter)); refreshScanParts(); });
   document.querySelectorAll("[data-bf]").forEach(b => b.onclick = () => { bookFilter = b.dataset.bf; document.querySelectorAll("[data-bf]").forEach(x => x.setAttribute("aria-pressed", x.dataset.bf === bookFilter)); refreshScanParts(); });
 }
 function bindHit(s) {
