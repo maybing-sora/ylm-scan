@@ -215,9 +215,11 @@ async function loadRemote(id) {
     remote[id] = { sheets: j.sheets || {}, issues: j.issues || [], book: j.book || null, breakdown: j.breakdown || null, lastCount: j.lastCount || null, doc: j.doc || null, received: j.received || null, at: nowIso() };
     if (j.session) { const s = fromRow(j.session); if (!sessions[id] || !sessions[id]._local) sessions[id] = s; else { sessions[id].status = s.status; sessions[id].receivedAt = s.receivedAt; sessions[id].receivedBy = s.receivedBy; } }
     LS.set("remote", remote); saveLocal(); online = true;
-  } catch (e) { if (e instanceof TypeError) online = false; }
+    delete remoteErr[id];
+  } catch (e) { if (e instanceof TypeError) online = false; else remoteErr[id] = e.message || String(e); }
   setSync();
 }
+let remoteErr = {}; // 讀單失敗的原因，顯示在結果頁
 
 /* ================= 匯總 ================= */
 function sheetsFor(id) {
@@ -1101,9 +1103,11 @@ function resultInner(s) {
       <td><span class="chip ${ST[x.st][0]}">${ST[x.st][1]}</span></td></tr>`).join("") || `<tr><td colspan="6" class="muted">沒有品項。</td></tr>`}</tbody>
   </table></div>`}
   <section class="row"><button class="grow" id="copy">複製表格</button></section>
+  ${remoteErr[view.id] ? `<div class="note warn">讀取這張單的資料失敗：${esc(remoteErr[view.id])}。請按首頁「重新整理」，還是不行就截圖給 Echo。</div>` : ""}
   ${locked(s) ? `<section class="panel"><p style="margin:0">已在 ${esc(fmt(s.confirmedAt))} 由 ${esc(s.confirmedBy || "")} 確認入帳。</p>
+      ${s.type === "receive" && remote[view.id] && !remote[view.id].doc && !remoteErr[view.id] ? `<div class="note">這張單還沒有驗收單 PDF（可能是在驗收單功能上線前入帳的，或上次產生失敗）。填操作人後按下方「產生驗收單」即可，不影響庫存。</div>` : ""}
       ${remote[view.id] && remote[view.id].doc ? `<a class="primary" href="${esc(remote[view.id].doc.url)}" target="_blank" rel="noopener" style="display:block;text-align:center;padding:12px;border-radius:8px;background:var(--accent);color:var(--accent-fg);text-decoration:none;font-weight:700">開啟${{ count: "盤差單", return: "退貨單" }[s.type] || "驗收單"} PDF</a><p class="small muted" style="margin:0">PDF 存在 Drive「點收盤點_驗收單」資料夾，可以直接轉給財務。</p>` : ""}
-      ${s.type === "receive" && !confirmAsk ? `<div class="panel" style="gap:8px">${whoFieldHTML("whoDoc")}<button id="refreshDoc">更新驗收單</button><span class="small muted">在異常清單改過狀態（已解決、誤報撤回）後按這裡，會依最新狀態重新產生 PDF，不影響庫存，也不用重新開啟。</span></div>` : ""}
+      ${s.type === "receive" && !confirmAsk ? `<div class="panel" style="gap:8px">${whoFieldHTML("whoDoc")}<button id="refreshDoc">${remote[view.id] && remote[view.id].doc ? "更新驗收單" : "產生驗收單"}</button><span class="small muted">在異常清單改過狀態（已解決、誤報撤回）後按這裡，會依最新狀態重新產生 PDF，不影響庫存，也不用重新開啟。</span></div>` : ""}
       ${confirmAsk ? `<div class="confirm"><b>確定要重新開啟？</b><span class="small">這張單寫入的庫存異動會被撤回，可以繼續修改後再確認一次。</span>${whoFieldHTML("whoAct")}<div class="row"><button id="no">取消</button><button class="danger grow" id="yesReopen">重新開啟</button></div></div>` : `<button class="danger" id="reopen">重新開啟</button>`}</section>`
     : `<section class="panel">
       ${pending ? `<div class="note warn">還有 ${pending} 筆掃描沒有上傳，連上網路後再確認入帳。</div>` : ""}
