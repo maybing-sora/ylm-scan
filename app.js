@@ -663,6 +663,7 @@ function expectHTML(s) {
   const pool = P.filter(p => p.v === s.vendor);
   const show = expectFilter.trim() ? new Set(suggest(expectFilter, pool, 9999).map(x => x.p.c)) : null;
   let shown = 0, total = 0;
+  const todo = [];
   const rows = pool.map(p => {
     const g = (t.get(p.c) || { qty: 0 }).qty, need = remainingFor(s, p.c, g);
     gotSum += g; needSum += need;
@@ -694,13 +695,18 @@ function expectHTML(s) {
       </div>`;
     }
     const hasOpen = openIssuesFor(p.c).length > 0;
+    if (g === 0 && need > 0 && !hasOpen) todo.push(p.c);
     const actions = g === need && !hasOpen
       ? `<button class="sm ghost" data-edit="${p.c}">有問題</button>`
       : `<button class="sm" data-match="${p.c}" data-need="${need - g}">${hasOpen ? "改為相符" : "相符 ✓"}</button><button class="sm" data-edit="${p.c}">有問題</button>`;
     return `<div class="item">${head}<span class="mono small">${g}/${need}</span><span class="chip ${st[0]}">${st[1]}</span>${tags}${actions}</div>`;
   });
   const sum = document.getElementById("recvSum"); if (sum) sum.textContent = `${gotSum} / ${needSum}`;
-  const head = show ? `<div class="row small" style="padding:6px 0"><span class="grow muted">找到 ${shown} / ${total} 項</span><button class="sm ghost" data-clearflt="1">顯示全部</button></div>` : "";
+  allOkCodes = todo;
+  const bulk = !todo.length ? "" : allOkAsk
+    ? `<div class="confirm"><b>${show ? "篩選出來的" : "剩下"}未點的 ${todo.length} 項，全部標為相符（到貨數量＝應收）？</b><span class="small">已經點過、有短少／多出或有問題的品項不會被改。標錯可以再按該列的「有問題」修改。</span><div class="row"><button class="sm" data-allokno="1">取消</button><button class="sm primary grow" data-allokyes="1">全部標為相符</button></div></div>`
+    : `<div class="row" style="padding:4px 0"><span class="grow small muted">${show ? "篩選結果中" : ""}還有 ${todo.length} 項未點</span><button class="sm" data-allok="1">全部到貨 ✓</button></div>`;
+  const head = (show ? `<div class="row small" style="padding:6px 0"><span class="grow muted">找到 ${shown} / ${total} 項</span><button class="sm ghost" data-clearflt="1">顯示全部</button></div>` : "") + bulk;
   if (show && !shown) return head + `<p class="small muted">${esc(s.vendor)} 沒有符合「${esc(expectFilter)}」的品項。</p>`;
   return head + (rows.join("") || `<p class="small muted">料號表裡沒有這家廠商的品項。</p>`);
 }
@@ -760,8 +766,23 @@ function bindMine() {
   m.querySelectorAll("button[data-c]").forEach(b => b.onclick = () => { bump(b.dataset.c, +b.dataset.d); refreshScanParts(); });
   m.querySelectorAll("input[data-c]").forEach(i => i.onchange = () => { bump(i.dataset.c, 0, +i.value || 0); refreshScanParts(); });
 }
+let allOkAsk = false, allOkCodes = [];
 function bindExpect() {
   const s = sessions[view.id];
+  document.querySelectorAll("[data-allok]").forEach(b => b.onclick = () => { allOkAsk = true; refreshScanParts(); });
+  document.querySelectorAll("[data-allokno]").forEach(b => b.onclick = () => { allOkAsk = false; refreshScanParts(); });
+  document.querySelectorAll("[data-allokyes]").forEach(b => b.onclick = () => {
+    allOkAsk = false;
+    const t = totals(view.id); let n = 0;
+    for (const code of allOkCodes) {
+      const g = (t.get(code) || { qty: 0 }).qty, need = remainingFor(s, code, g);
+      if (g !== 0 || need <= 0) continue;
+      if (!bump(code, 0, need)) break;
+      n++;
+    }
+    lastHit = null; if (n) toast(`已將 ${n} 項標為相符`);
+    refreshScanParts();
+  });
   document.querySelectorAll("[data-clearflt]").forEach(b => b.onclick = () => { expectFilter = ""; const f = document.getElementById("flt"); if (f) f.value = ""; refreshScanParts(); });
   const myCount = code => { const sh = sheets[sheetKey(view.id, view.zone)]; return (sh && sh.counts[code]) || 0; };
   document.querySelectorAll("[data-match]").forEach(b => b.onclick = () => {
