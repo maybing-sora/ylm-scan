@@ -227,11 +227,11 @@ function sheetsFor(id) {
   for (const [k, sh] of Object.entries(sheets)) if (sh.sessionId === id) m[k] = sh;
   return m;
 }
-const RECOUNT = "複盤";
+const RECOUNT = "複盤", FIX = "更正";
 function totals(id) {
   const t = new Map();
   for (const sh of Object.values(sheetsFor(id))) {
-    if (sh.zone === RECOUNT) continue;
+    if (sh.zone === RECOUNT || sh.zone === FIX) continue;
     for (const [code, q] of Object.entries(sh.counts || {})) {
       if (!q) continue;
       const r = t.get(code) || { qty: 0, zones: {}, people: new Set() };
@@ -239,14 +239,24 @@ function totals(id) {
       t.set(code, r);
     }
   }
+  // 驗收等單據的「更正」：直接取代這個品項的合計（盤點用複盤，另外處理）
+  const s0 = sessions[id];
+  if (!s0 || s0.type !== "count") for (const [code, f] of Object.entries(fixesFor(id))) {
+    const g = t.get(code) || { qty: 0, zones: {}, people: new Set() };
+    g.qty = f.qty; g.zones = { [FIX]: f.qty }; g.fixed = f; if (g.people && g.people.add) g.people.add(f.person);
+    t.set(code, g);
+  }
   return t;
 }
 
+// 更正（驗收）：同品項取最後一次的數量（可以是 0）
+function fixesFor(id) { return latestByZone(id, FIX); }
 // 盤點的複盤：同品項取最後一次複盤的數量（可以是 0）
-function recounts(id) {
+function recounts(id) { return latestByZone(id, RECOUNT); }
+function latestByZone(id, zone) {
   const m = {};
   for (const sh of Object.values(sheetsFor(id))) {
-    if (sh.zone !== RECOUNT) continue;
+    if (sh.zone !== zone) continue;
     for (const [code, q] of Object.entries(sh.counts || {})) {
       const at = sh.updatedAt || "";
       if (!m[code] || at >= m[code].at) m[code] = { qty: +q || 0, person: sh.person || "", at };
@@ -671,7 +681,8 @@ function expectHTML(s) {
     total++;
     if (show && !show.has(p.c)) return "";
     shown++;
-    const st = g === need ? ["ok", "相符"] : g === 0 ? ["", "未點"] : g < need ? ["warn", `短 ${need - g}`] : ["bad", `多 ${g - need}`];
+    const fx = (t.get(p.c) || {}).fixed;
+    const st = g === need ? ["ok", "相符"] : g === 0 ? (fx ? ["bad", "未到"] : ["", "未點"]) : g < need ? ["warn", `短 ${need - g}`] : ["bad", `多 ${g - need}`];
     const head = `<span class="grow"><span class="name">${esc(p.n)}</span><br><span class="small mono muted">${p.c}${p.bc ? "" : " · 需貼六福標"}${need !== p.q ? ` · 訂 ${p.q}，先前已收 ${p.q - need}` : ""}</span></span>`;
     const kinds = issuesFor(p.c);
     const tags = kinds.filter(k => !k.startsWith("數量")).map(k => `<span class="chip bad">${esc(shortKind(k))}</span>`).join("");
@@ -695,10 +706,10 @@ function expectHTML(s) {
       </div>`;
     }
     const hasOpen = openIssuesFor(p.c).length > 0;
-    if (g === 0 && need > 0 && !hasOpen) todo.push(p.c);
+    if (g === 0 && need > 0 && !hasOpen && !((t.get(p.c) || {}).fixed)) todo.push(p.c);
     const actions = g === need && !hasOpen
       ? `<button class="sm ghost" data-edit="${p.c}">有問題</button>`
-      : `<button class="sm" data-match="${p.c}" data-need="${need - g}">${hasOpen ? "改為相符" : "相符 ✓"}</button><button class="sm" data-edit="${p.c}">有問題</button>`;
+      : `<button class="sm" data-match="${p.c}" data-need="${need - g}" data-total="${need}">${hasOpen ? "改為相符" : "相符 ✓"}</button><button class="sm" data-edit="${p.c}">有問題</button>`;
     return `<div class="item">${head}<span class="mono small">${g}/${need}</span><span class="chip ${st[0]}">${st[1]}</span>${tags}${actions}</div>`;
   });
   const sum = document.getElementById("recvSum"); if (sum) sum.textContent = `${gotSum} / ${needSum}`;
@@ -766,6 +777,16 @@ function bindMine() {
   m.querySelectorAll("button[data-c]").forEach(b => b.onclick = () => { bump(b.dataset.c, +b.dataset.d); refreshScanParts(); });
   m.querySelectorAll("input[data-c]").forEach(i => i.onchange = () => { bump(i.dataset.c, 0, +i.value || 0); refreshScanParts(); });
 }
+// 把某品項的實收直接更正為 qty（不管之前是誰記的），寫在這支手機的「更正」紀錄
+function writeFix(code, qty) {
+  if (!person) { toast("請先填操作人"); return false; }
+  const s = sessions[view.id]; if (!s || locked(s)) { toast("這張單已確認入帳，要先重新開啟"); return false; }
+  const k = `${view.id}|${device}|${FIX}`;
+  const sh = sheets[k] = sheets[k] || { sessionId: view.id, zone: FIX, person, device, counts: {}, updatedAt: nowIso() };
+  sh.counts[code] = Math.max(0, Math.round(+qty || 0)); sh.person = person; sh.updatedAt = nowIso(); saveLocal();
+  enqueue("saveSheet", k, { sessionId: view.id, key: k, zone: FIX, person, device, counts: sh.counts });
+  return true;
+}
 let allOkAsk = false, allOkCodes = [];
 function bindExpect() {
   const s = sessions[view.id];
@@ -786,10 +807,10 @@ function bindExpect() {
   document.querySelectorAll("[data-clearflt]").forEach(b => b.onclick = () => { expectFilter = ""; const f = document.getElementById("flt"); if (f) f.value = ""; refreshScanParts(); });
   const myCount = code => { const sh = sheets[sheetKey(view.id, view.zone)]; return (sh && sh.counts[code]) || 0; };
   document.querySelectorAll("[data-match]").forEach(b => b.onclick = () => {
-    const code = b.dataset.match, need = +b.dataset.need;
-    const mine = myCount(code), target = mine + need;
-    if (target < 0) { toast("其他人記的數量比應收還多，請到「有問題」調整"); return; }
-    if (bump(code, 0, target)) {
+    const code = b.dataset.match, need = +b.dataset.need, total = +b.dataset.total;
+    const mine = myCount(code), target = mine + need, g = totals(view.id).get(code);
+    const ok = (g && g.fixed) || target < 0 ? writeFix(code, total) : bump(code, 0, target);
+    if (ok) {
       const p = byCode.get(code), n = withdrawOpen(code); lastHit = null;
       toast(`已標記相符：${p ? p.n : code}${n ? `，撤回 ${n} 筆回報` : ""}`);
     }
@@ -806,10 +827,11 @@ function bindExpect() {
     if (raw === "") { toast("請填實收數量"); return; }
     const qty = Math.max(0, Math.round(+raw || 0));
     const others = got - myCount(code); // 其他人或其他區域已記的數量
-    if (qty < others) { toast(`其他人已記 ${others} 件，實收不能小於這個數字`); return; }
+    const gg = totals(view.id).get(code), useFix = (gg && gg.fixed) || qty < others;
     let photoIds = [];
     try { photoIds = pp.ids.concat(await stashPhotos(pkey)); } catch (e) { return; }
-    if (!bump(code, 0, qty - others)) return;
+    // 實收比其他人已記的少（例如別人按了相符、實際沒到）：直接更正為最終數字
+    if (!(useFix ? writeFix(code, qty) : bump(code, 0, qty - others))) return;
     const p = byCode.get(code), note = document.getElementById("note-" + code).value.trim();
     const kq = Math.max(1, Math.round(+document.getElementById("kq-" + code).value || 1));
     const list = [];

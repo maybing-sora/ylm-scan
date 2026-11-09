@@ -277,7 +277,7 @@ function sessionTotals_(id) {
     var c = String(r[5]);
     if (c.charAt(0) === '?') return; // 未知條碼不入帳
     var q = Number(r[6] || 0), at = r[7] instanceof Date ? iso_(r[7]) : String(r[7]);
-    if (String(r[2]) === '複盤') {
+    if (String(r[2]) === '複盤' || String(r[2]) === '更正') {
       if (!(c in rcAt) || at >= rcAt[c]) { rc[c] = q; rcBy[c] = String(r[3] || ''); rcAt[c] = at; }
       return;
     }
@@ -356,10 +356,28 @@ function saveSheet_(b) {
   var t = nowIso_(), rows = [];
   Object.keys(b.counts || {}).forEach(function (code) {
     var q = Number(b.counts[code] || 0);
-    if (q || b.zone === '複盤') rows.push([b.key, b.sessionId, b.zone || '', b.person || '', b.device || '', code, q, t]);
+    if (q || b.zone === '複盤' || b.zone === '更正') rows.push([b.key, b.sessionId, b.zone || '', b.person || '', b.device || '', code, q, t]);
   });
+  if (b.zone === '更正') logFixes_(b);
   replaceRows_('scans', function (r) { return String(r[0]) !== String(b.key); }, rows, 6);
   return { saved: rows.length };
+}
+
+// 驗收「更正」：這次改了哪些品項，寫進操作紀錄（原本各人記的合計 → 更正後）
+function logFixes_(b) {
+  var prev = {}, orig = {}, P = {};
+  rows_('scans').forEach(function (r) {
+    if (String(r[1]) !== String(b.sessionId)) return;
+    var c = String(r[5]);
+    if (String(r[0]) === String(b.key)) prev[c] = Number(r[6] || 0);
+    else if (String(r[2]) !== '更正' && String(r[2]) !== '複盤') orig[c] = (orig[c] || 0) + Number(r[6] || 0);
+  });
+  var changed = Object.keys(b.counts || {}).filter(function (c) { return Number(b.counts[c] || 0) !== (c in prev ? prev[c] : (orig[c] || 0)); });
+  if (!changed.length) return;
+  try { loadProducts_().forEach(function (p) { P[p.c] = p; }); } catch (e) {}
+  log_('更正數量', b.sessionId, changed.map(function (c) {
+    return ((P[c] || {}).n || c) + '：' + (orig[c] || 0) + ' → ' + Number(b.counts[c] || 0) + ' 件';
+  }).join('；'));
 }
 
 // 保留 keep() 為真的列，再接上 newRows，整張表一次寫回（比逐列刪除快很多）
